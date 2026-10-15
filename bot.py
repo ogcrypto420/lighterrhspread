@@ -589,6 +589,10 @@ class App:
                 out.update({k: m for k, m in self.markets.items() if m.ex == ex})
         if errors == len(EXCHANGES):
             raise RuntimeError("ни одна биржа не ответила")
+        # на Core оставляем только те акции, что есть на RH — Core нужен лишь для сравнения
+        rh = {(m.base, m.mtype) for m in out.values() if m.ex == "rh"}
+        if rh:
+            out = {k: m for k, m in out.items() if m.ex == "rh" or (m.base, m.mtype) in rh}
         return out
 
     async def markets_loop(self) -> None:
@@ -881,7 +885,7 @@ class App:
         return (f"📊 <b>Топ-{min(top, len(rows))} акций по спреду, RH и CORE</b> (✅ проходят фильтры: {ok})\n"
                 f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
                 f"Impact — проскальзывание на {fmt_usd(s.size)}, %, глубина — меньшая из сторон в ±{s.band:g}%, "
-                "— — пары нет на бирже.\nТолько одна биржа: /status_rh · /status_core")
+                "— — пары нет на CORE.\nТолько одна биржа: /status_rh · /status_core")
 
     def welcome_text(self, u: User) -> str:
         s = u.s

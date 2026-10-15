@@ -84,7 +84,7 @@ WantedBy=multi-user.target
 
 ## Команды в Telegram
 
-- `/status` — топ-15 пар по спреду прямо сейчас (✅ — проходит все фильтры), `/status 30` — топ-30
+- `/status` — топ-15 пар по спреду прямо сейчас (✅ — проходит все фильтры), `/status 30` — топ-30. С включённым Core — одна строка на акцию: спред RH и CORE рядом; подробно по бирже — `/status_rh`, `/status_core`
 - `/settings` — текущие пороги
 - `/set spread 0.005` · `/set size 10000` · `/set impact 0.01` · `/set depth 50000` · `/set band 0.05` · `/set hold 10` · `/set cooldown 30` · `/set notify_lost off`
 - `/pause`, `/resume` — выключить/включить алерты

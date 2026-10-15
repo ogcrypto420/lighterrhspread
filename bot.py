@@ -820,24 +820,55 @@ class App:
                 f"биржи: {'RH + CORE' if s.venue == 'both' else 'только RH'} (/core — переключить)"
                 + ("\n\n⏸ <b>Алерты на паузе</b> — /resume" if u.paused else ""))
 
-    def status_text(self, u: User, top: int = 15) -> str:
+    def status_text(self, u: User, top: int = 15, only: str | None = None) -> str:
+        """only=None: при включённом Core — сводная таблица RH|CORE в одну строку на акцию;
+        only='rh'/'core' — подробная таблица по одной бирже."""
         s = u.s
-        rows = [(m, met) for m in self.markets.values() if s.wants(m) and (met := self.metrics_for(m, s))]
+        if only is None and s.venue == "both" and "core" in EXCHANGES:
+            return self.status_merged(u, top)
+        ex = only or "rh"
+        rows = [(m, met) for m in self.markets.values() if m.ex == ex and (met := self.metrics_for(m, s))]
         if not rows:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows.sort(key=lambda r: (r[1].spread_pct, r[1].impact))
-        lines = [f"{'Пара':<13}{'Спред%':>7}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
+        lines = [f"{'Пара':<9}{'Спред%':>7}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
         for m, met in rows[:top]:
             mark = "✅" if passes(met, s) else "  "
             imp = "∞" if math.isinf(met.impact) else f"{met.impact:.3f}"
-            tag = "RH" if m.ex == "rh" else "CORE"
-            lines.append(f"{mark}{m.symbol[:6]:<6}{tag:>5}{met.spread_pct:>7.4f}{met.spread_ticks:>4g}"
+            lines.append(f"{mark}{m.symbol[:7]:<7}{met.spread_pct:>7.4f}{met.spread_ticks:>4g}"
                          f"{imp:>7}{fmt_usd(met.depth):>6}")
         ok = sum(1 for _, met in rows if passes(met, s))
-        return (f"📊 <b>Топ-{min(top, len(rows))} по спреду</b> (проходят твои фильтры: {ok}/{len(rows)})\n"
+        name = EXCHANGES[ex][0]
+        return (f"📊 <b>{name}: топ-{min(top, len(rows))} по спреду</b> (проходят фильтры: {ok}/{len(rows)})\n"
                 f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
                 f"Impact — проскальзывание на {fmt_usd(s.size)}, %, "
                 f"глубина — меньшая из сторон в ±{s.band:g}%")
+
+    def status_merged(self, u: User, top: int) -> str:
+        s = u.s
+        by_base: dict[str, dict[str, Metrics]] = {}
+        for m in self.markets.values():
+            if m.mtype != "perp":
+                continue
+            met = self.metrics_for(m, s)
+            if met:
+                by_base.setdefault(m.base, {})[m.ex] = met
+        if not by_base:
+            return "Стаканы ещё загружаются, попробуй через несколько секунд."
+        rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))
+
+        def cell(met: Metrics | None) -> str:
+            if met is None:
+                return "—"
+            return ("✅" if passes(met, s) else "") + f"{met.spread_pct:.4f}"
+
+        lines = [f"{'Пара':<7}{'RH':>10}{'CORE':>10}"]
+        for base, mets in rows[:top]:
+            lines.append(f"{base[:7]:<7}{cell(mets.get('rh')):>10}{cell(mets.get('core')):>10}")
+        return (f"📊 <b>Топ-{min(top, len(rows))} по спреду, RH и CORE</b>\n"
+                f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
+                "Спред в %, ✅ — проходит все твои фильтры, — — пары нет на бирже.\n"
+                "Подробно с impact и глубиной: /status_rh · /status_core")
 
     def welcome_text(self, u: User) -> str:
         s = u.s
@@ -894,8 +925,15 @@ class App:
             reply = self.welcome_text(u)
         elif cmd == "/help":
             reply = self.help_text(chat_id)
-        elif cmd == "/status":
-            reply = self.status_text(u, min(int(args[0]), 50) if args and args[0].isdigit() else 15)
+        elif cmd in ("/status", "/status_rh", "/status_core"):
+            only = {"/status_rh": "rh", "/status_core": "core"}.get(cmd)
+            for a in args:
+                if a.lower() in ("rh", "core"):
+                    only = a.lower()
+            if only == "core" and "core" not in EXCHANGES:
+                only = "rh"
+            num = next((int(a) for a in args if a.isdigit()), 15)
+            reply = self.status_text(u, min(num, 50), only)
         elif cmd == "/settings":
             reply = self.settings_text(u)
             if note := self.unreachable_note(u.s):

@@ -861,11 +861,11 @@ class App:
         ok = sum(1 for _, met in rows if passes(met, s))
         name = EXCHANGES[ex][0]
         out = [f"📊 <b>{name}: топ-{min(top, len(rows))} по спреду</b> (проходят фильтры: {ok}/{len(rows)})",
-               "<code>" + html.escape(f"{'Спред%':>8}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}") + "</code>"]
+               "<code>" + html.escape(f"{'Спред%':>8}{'Тик':>4}{'Проск.':>7}{'Глуб.':>6}") + "</code>"]
         for m, met in rows[:top]:
             out.append(f"<b>{html.escape(m.symbol)}</b>" + (" ✅" if passes(met, s) else ""))
             out.append("<code>" + html.escape(self._row("", met, 0)) + "</code>")
-        out.append(f"\nImpact — проскальзывание на {fmt_usd(s.size)}, %, "
+        out.append(f"\nПроск. — проскальзывание на {fmt_usd(s.size)}, %, "
                    f"глубина — меньшая из сторон в ±{s.band:g}%")
         return "\n".join(out)
 
@@ -924,7 +924,7 @@ class App:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))
         out = [f"📊 <b>Топ-{min(top, len(rows))} акций по спреду, RH и CORE</b>",
-               "<code>" + html.escape(f"{'':5}{'Спред%':>8}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}") + "</code>"]
+               "<code>" + html.escape(f"{'':5}{'Спред%':>8}{'Тик':>4}{'Проск.':>7}{'Глуб.':>6}") + "</code>"]
         ok = 0
         for base, mets in rows[:top]:
             out.append(f"\n<b>{html.escape(base)}</b>")
@@ -936,7 +936,7 @@ class App:
                 good = passes(met, s)
                 ok += good
                 out.append("<code>" + html.escape(self._row(tag, met, 5)) + "</code>" + (" ✅" if good else ""))
-        out.append(f"\n✅ проходят фильтры: {ok}. Impact — проскальзывание на {fmt_usd(s.size)}, %, "
+        out.append(f"\n✅ проходят фильтры: {ok}. Проск. — проскальзывание на {fmt_usd(s.size)}, %, "
                    f"глубина — меньшая из сторон в ±{s.band:g}%, — — пары нет на CORE.\n"
                    "Только одна биржа: /status_rh · /status_core")
         return "\n".join(out)

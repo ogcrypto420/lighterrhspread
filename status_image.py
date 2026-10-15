@@ -93,13 +93,13 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
         "ticker": (PAD + 8, "l"),
         "tag": (232, "l"),
         "spread": (430, "r"),
-        "ticks": (510, "r"),
-        "impact": (650, "r"),
+        "ticks": (500, "r"),
+        "impact": (680, "r"),
         "depth": (790, "r"),
         "ok": (W - PAD - 40, "c"),
     }
     heads = {"ticker": "Тикер", "tag": "Биржа", "spread": "Спред, %", "ticks": "Тики",
-             "impact": "Impact, %", "depth": "Глубина", "ok": "Фильтр"}
+             "impact": "Проскальзывание, %", "depth": "Глубина", "ok": "Фильтр"}
 
     def put(col: str, y: int, txt: str, font, fill):
         x, al = cols[col]
@@ -156,7 +156,7 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
             d.line([((PAD + 12) * s, (y - 3) * s), ((W - PAD - 12) * s, (y - 3) * s)], fill=LINE, width=s)
 
     # подвал с фильтрами
-    foot = (f"Фильтры: спред ≤ {spread:g}%  ·  impact ≤ {impact:g}% на {_usd(size)}  ·  "
+    foot = (f"Фильтры: спред ≤ {spread:g}%  ·  проскальзывание ≤ {impact:g}% на {_usd(size)}  ·  "
             f"глубина ≥ {_usd(depth)} в ±{band:g}%")
     d.text((PAD * s, (H - foot_h + 26) * s), foot, font=f_sub, fill=MUTED)
     d.text((PAD * s, (H - foot_h + 48) * s), "зелёный — проходит фильтр, красный — нет", font=f_sub, fill=MUTED)

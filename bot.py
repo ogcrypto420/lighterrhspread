@@ -727,7 +727,7 @@ class App:
             s = u.s
             good_new, lost = [], []
             for m in self.markets.values():
-                if not s.wants(m):
+                if m.ex != "rh":        # алерты только по RH; Core показывается строкой сравнения
                     continue
                 met = self.metrics_for(m, s, cache)
                 st = u.pairs.setdefault(m.key, PairState())
@@ -769,7 +769,10 @@ class App:
 
     @staticmethod
     def good_text(m: Market, met: Metrics, held: float, s: Settings, twin: str = "") -> str:
-        return (f"🟢 <b>{html.escape(m.label)}</b> — узкий спред, плотный стакан\n"
+        both = twin.endswith("✅")
+        head = (f"🟢🟢 <b>{html.escape(m.symbol)} · RH + CORE</b> — узкий спред на обеих биржах"
+                if both else f"🟢 <b>{html.escape(m.label)}</b> — узкий спред, плотный стакан")
+        return (f"{head}\n"
                 f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · "
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
                 f"Проскальзывание на {fmt_usd(s.size)}: buy {fmt_pct(met.buy_impact)} / "
@@ -859,7 +862,9 @@ class App:
         rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))
         lines = [f"{'Пара':<6}{'':5}{'Спред%':>9}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
         ok = 0
-        for base, mets in rows[:top]:
+        for i, (base, mets) in enumerate(rows[:top]):
+            if i:
+                lines.append("")
             first = True
             for ex, tag in (("rh", "RH"), ("core", "CORE")):
                 met = mets.get(ex)
@@ -887,7 +892,8 @@ class App:
                 f"▫️ рыночная заявка на {fmt_usd(s.size)} сдвинет цену не больше чем на {s.impact:g}%\n"
                 f"▫️ в ±{s.band:g}% от цены стоит минимум {fmt_usd(s.depth)} на покупку и на продажу\n\n"
                 f"Если всё держится {s.hold:g} с — пришлю 🟢 с цифрами, когда уйдёт — 🔴.\n\n"
-                "Хочешь следить ещё и за основным Lighter — /core.\n\n"
+                "Командой /core можно добавить сравнение с основным Lighter: в алертах и /status будет видно, "
+                "что с той же акцией там.\n\n"
                 "Ты уже подписан ✅ Настрой под себя: /help")
 
     def help_text(self, chat_id) -> str:
@@ -901,7 +907,7 @@ class App:
                 "/settings — твои текущие фильтры\n"
                 "/pairs — пары в мониторинге\n"
                 "/pause · /resume — выключить и включить алерты\n"
-                "/core — добавить или убрать основной Lighter (Core)\n"
+                "/core — добавить или убрать сравнение с основным Lighter (Core)\n"
                 "/reset — вернуть настройки по умолчанию\n"
                 "/help — эта справка")
 
@@ -961,8 +967,9 @@ class App:
                 u.s.venue = "rh" if u.s.venue == "both" else "both"
                 for st in u.pairs.values():
                     st.ok_since = None
-                reply = ("➕ Core добавлен: теперь алерты по Lighter RH и основному Lighter, "
-                         "а в каждом алерте видна та же акция на второй бирже. /core — убрать."
+                reply = ("➕ Core добавлен. Алерты по-прежнему по Lighter RH, но в каждом видна та же акция "
+                         "на основном Lighter, а если пара хороша на обеих биржах — придёт 🟢🟢. "
+                         "В /status — обе биржи. /core — убрать."
                          if u.s.venue == "both" else
                          "➖ Core убран: снова только Lighter RH. /core — вернуть.")
         elif cmd == "/reset":
@@ -1011,7 +1018,7 @@ class App:
             {"command": "pairs", "description": "Пары в мониторинге"},
             {"command": "pause", "description": "Выключить алерты"},
             {"command": "resume", "description": "Включить алерты"},
-            {"command": "core", "description": "Добавить/убрать основной Lighter"},
+            {"command": "core", "description": "Сравнение с основным Lighter вкл/выкл"},
             {"command": "reset", "description": "Сбросить настройки"},
         ])
         while True:

@@ -88,6 +88,17 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
     d.text((PAD * s, 26 * s), title, font=f_title, fill=TEXT)
     d.text((PAD * s, 66 * s), f"Lighter · обновлено {msk:%H:%M:%S} МСК", font=f_sub, fill=MUTED)
 
+    # подпись бота справа в шапке: LIGHTER SPREAD BOT
+    f_brand = _font("Inter-Bold.otf", 15)
+    track = 2.2 * s
+    parts = [("LIGHTER SPREAD ", TEXT), ("BOT", GREEN)]
+    chars = [(ch, col) for txt, col in parts for ch in txt]
+    total = sum(d.textlength(ch, font=f_brand) for ch, _ in chars) + track * (len(chars) - 1)
+    x = (W - PAD) * s - total
+    for ch, col in chars:
+        d.text((x, 38 * s), ch, font=f_brand, fill=col)
+        x += d.textlength(ch, font=f_brand) + track
+
     # колонки: (заголовок, правая граница x, выравнивание)
     cols = {
         "ticker": (PAD + 8, "l"),

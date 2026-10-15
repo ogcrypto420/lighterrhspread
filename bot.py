@@ -736,8 +736,10 @@ class App:
                     self.tg_offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
                     text = msg.get("text") or ""
-                    if text.startswith("/"):
-                        await self.handle_command(str(msg["chat"]["id"]), text)
+                    # можно несколько команд в одном сообщении — каждая с новой строки
+                    for line in text.splitlines():
+                        if line.strip().startswith("/"):
+                            await self.handle_command(str(msg["chat"]["id"]), line.strip())
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001

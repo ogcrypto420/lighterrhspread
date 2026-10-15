@@ -78,7 +78,7 @@ CORE_WS_URL = env_str("CORE_WS_URL", "wss://mainnet.zklighter.elliot.ai/stream?r
 # код биржи → (название в сообщениях, REST, WebSocket)
 EXCHANGES: dict[str, tuple[str, str, str]] = {"rh": ("RH", API_URL, WS_URL)}
 if ENABLE_CORE:
-    EXCHANGES["core"] = ("Core", CORE_API_URL, CORE_WS_URL)
+    EXCHANGES["core"] = ("CORE", CORE_API_URL, CORE_WS_URL)
 
 INCLUDE_ETF = env_bool("INCLUDE_ETF", False)              # SPY, QQQ, SOXL, USO, SLV, SGOV
 INCLUDE_PREIPO = env_bool("INCLUDE_PREIPO", True)        # OPENAI, ANTHROPIC, SHEIN …
@@ -133,7 +133,7 @@ class Settings:
     cooldown: float = env_float("COOLDOWN_MIN", 15)         # пауза между алертами по одной паре, мин
     grace: float = env_float("LOST_GRACE_SECONDS", 10)      # через сколько сек плохого стакана пара «ушла»
     notify_lost: bool = env_bool("NOTIFY_LOST", True)       # слать ли «пара ушла»
-    venue: str = env_str("VENUE", "both").lower()           # какие биржи: rh / core / both
+    venue: str = env_str("VENUE", "rh").lower()             # rh — только Robinhood, both — RH + Core (/core)
 
     def wants(self, m: "Market") -> bool:
         return self.venue in ("both", m.ex)
@@ -166,9 +166,7 @@ SETTING_HELP = {
     "cooldown": "пауза между алертами по одной паре, мин",
     "grace": "через сколько секунд слать «🔴 пара ушла»",
     "notify_lost": "слать «🔴 пара ушла» (on/off)",
-    "venue": "какие биржи смотреть: rh, core или both",
 }
-VENUES = {"rh": "rh", "robinhood": "rh", "core": "core", "lighter": "core", "both": "both", "all": "both", "все": "both"}
 
 
 # ───────────────────────────── рынки ─────────────────────────────
@@ -436,7 +434,7 @@ class User:
     pairs: dict[str, PairState] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
-        return {"s": self.s.to_dict(), "paused": self.paused, "joined": self.joined,
+        return {"v": 2, "s": self.s.to_dict(), "paused": self.paused, "joined": self.joined,
                 "pairs": {key: {"alerted": st.alerted, "last_alert": st.last_alert}
                           for key, st in self.pairs.items() if st.alerted or st.last_alert}}
 
@@ -444,6 +442,8 @@ class User:
     def from_dict(cls, chat_id: str, d: dict) -> "User":
         u = cls(chat_id, Settings.from_dict(d.get("s") or {}), bool(d.get("paused")),
                 float(d.get("joined") or time.time()))
+        if int(d.get("v", 1)) < 2:      # до версии 2 Core был включён у всех по умолчанию
+            u.s.venue = "rh"
         for key, st in (d.get("pairs") or {}).items():
             key = f"rh:{key}" if str(key).isdigit() else str(key)   # старый формат — только RH
             u.pairs[key] = PairState(alerted=bool(st.get("alerted")),
@@ -751,7 +751,9 @@ class App:
         return out
 
     def twin_line(self, m: Market, s: Settings, cache: dict | None = None) -> str:
-        """Та же акция на другой бирже — для сравнения в алерте."""
+        """Та же акция на другой бирже — для сравнения в алерте (если у пользователя включён Core)."""
+        if s.venue != "both":
+            return ""
         for o in self.markets.values():
             if o.ex != m.ex and o.base == m.base and o.mtype == m.mtype:
                 om = self.metrics_for(o, s, cache)
@@ -759,8 +761,10 @@ class App:
                     return f"На {o.ex_name}: стакан недоступен"
                 ok = " ✅" if passes(om, s) else ""
                 diff = (om.mid / self.metrics_for(m, s, cache).mid - 1) * 100 if self.metrics_for(m, s, cache) else 0
+                where = "выше" if diff > 0 else "ниже"
+                price = f"цена там на {abs(diff):.3f}% {where}" if abs(diff) >= 0.0005 else "цена та же"
                 return (f"На {o.ex_name}: спред {fmt_pct(om.spread_pct)} ({om.spread_ticks:g} тик.), "
-                        f"impact {fmt_pct(om.impact)}, цена {diff:+.3f}%{ok}")
+                        f"impact {fmt_pct(om.impact)}, {price}{ok}")
         return ""
 
     @staticmethod
@@ -813,7 +817,7 @@ class App:
                 f"depth ≥ {fmt_usd(s.depth)} на сторону в band ±{s.band:g}%\n"
                 f"hold {s.hold:g} с · cooldown {s.cooldown:g} мин\n"
                 f"grace {s.grace:g} с · notify_lost {'on' if s.notify_lost else 'off'}\n"
-                f"venue {s.venue} ({ {'both': 'RH + Core', 'rh': 'только RH', 'core': 'только Core'}.get(s.venue, s.venue) })"
+                f"биржи: {'RH + CORE' if s.venue == 'both' else 'только RH'} (/core — переключить)"
                 + ("\n\n⏸ <b>Алерты на паузе</b> — /resume" if u.paused else ""))
 
     def status_text(self, u: User, top: int = 15) -> str:
@@ -822,35 +826,35 @@ class App:
         if not rows:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows.sort(key=lambda r: (r[1].spread_pct, r[1].impact))
-        lines = [f"{'Пара':<11}{'Спред%':>7}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
+        lines = [f"{'Пара':<13}{'Спред%':>7}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
         for m, met in rows[:top]:
             mark = "✅" if passes(met, s) else "  "
             imp = "∞" if math.isinf(met.impact) else f"{met.impact:.3f}"
-            tag = "R" if m.ex == "rh" else "C"
-            lines.append(f"{mark}{m.symbol[:7]:<7}{tag:>2}{met.spread_pct:>7.4f}{met.spread_ticks:>4g}"
+            tag = "RH" if m.ex == "rh" else "CORE"
+            lines.append(f"{mark}{m.symbol[:6]:<6}{tag:>5}{met.spread_pct:>7.4f}{met.spread_ticks:>4g}"
                          f"{imp:>7}{fmt_usd(met.depth):>6}")
         ok = sum(1 for _, met in rows if passes(met, s))
         return (f"📊 <b>Топ-{min(top, len(rows))} по спреду</b> (проходят твои фильтры: {ok}/{len(rows)})\n"
                 f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
-                f"R — Lighter RH, C — Lighter Core. Impact — проскальзывание на {fmt_usd(s.size)}, %, "
+                f"Impact — проскальзывание на {fmt_usd(s.size)}, %, "
                 f"глубина — меньшая из сторон в ±{s.band:g}%")
 
     def welcome_text(self, u: User) -> str:
         s = u.s
-        return ("👋 <b>Привет!</b> Я слежу за стаканами всех акций и pre-IPO на Lighter Robinhood и основном Lighter (Core) "
+        return ("👋 <b>Привет!</b> Я слежу за стаканами всех акций и pre-IPO на Lighter Robinhood "
                 "и пишу, когда по паре можно зайти почти без потерь на спреде.\n\n"
                 "Каждую секунду проверяю у каждой пары:\n"
                 f"▫️ спред ≤ {s.spread:g}%\n"
                 f"▫️ рыночная заявка на {fmt_usd(s.size)} сдвинет цену не больше чем на {s.impact:g}%\n"
                 f"▫️ в ±{s.band:g}% от цены стоит минимум {fmt_usd(s.depth)} на покупку и на продажу\n\n"
                 f"Если всё держится {s.hold:g} с — пришлю 🟢 с цифрами, когда уйдёт — 🔴.\n\n"
-                "В алерте видно и вторую биржу — где по этой акции сейчас уже спред.\n\n"
+                "Хочешь следить ещё и за основным Lighter — /core.\n\n"
                 "Ты уже подписан ✅ Настрой под себя: /help")
 
     def help_text(self, chat_id) -> str:
         sets = "\n".join(f"<code>{k}</code> — {v}" for k, v in SETTING_HELP.items())
         return ("<b>Настройки</b> — командой <code>/set</code>, например:\n"
-                "<code>/set spread 0.005</code>\n<code>/set size 10000</code>\n<code>/set venue rh</code>\n\n"
+                "<code>/set spread 0.005</code>\n<code>/set size 10000</code>\n\n"
                 f"{sets}\n\n"
                 "Можно несколько команд одним сообщением, каждую с новой строки.\n\n"
                 "<b>Команды</b>\n"
@@ -858,6 +862,7 @@ class App:
                 "/settings — твои текущие фильтры\n"
                 "/pairs — пары в мониторинге\n"
                 "/pause · /resume — выключить и включить алерты\n"
+                "/core — добавить или убрать основной Lighter (Core)\n"
                 "/reset — вернуть настройки по умолчанию\n"
                 "/help — эта справка")
 
@@ -903,6 +908,17 @@ class App:
         elif cmd == "/resume":
             u.paused = False
             reply = "▶️ Алерты включены."
+        elif cmd == "/core":
+            if "core" not in EXCHANGES:
+                reply = "Мониторинг Core сейчас выключен на уровне бота."
+            else:
+                u.s.venue = "rh" if u.s.venue == "both" else "both"
+                for st in u.pairs.values():
+                    st.ok_since = None
+                reply = ("➕ Core добавлен: теперь алерты по Lighter RH и основному Lighter, "
+                         "а в каждом алерте видна та же акция на второй бирже. /core — убрать."
+                         if u.s.venue == "both" else
+                         "➖ Core убран: снова только Lighter RH. /core — вернуть.")
         elif cmd == "/reset":
             u.s = Settings()
             u.pairs.clear()
@@ -923,10 +939,6 @@ class App:
         try:
             if key == "notify_lost":
                 val = raw.lower() in ("on", "1", "true", "yes", "да", "вкл")
-            elif key == "venue":
-                if raw.lower() not in VENUES:
-                    return "venue — <code>rh</code>, <code>core</code> или <code>both</code>."
-                val = VENUES[raw.lower()]
             else:
                 val = float(raw)
                 if val < 0 or math.isinf(val) or math.isnan(val):
@@ -953,6 +965,7 @@ class App:
             {"command": "pairs", "description": "Пары в мониторинге"},
             {"command": "pause", "description": "Выключить алерты"},
             {"command": "resume", "description": "Включить алерты"},
+            {"command": "core", "description": "Добавить/убрать основной Lighter"},
             {"command": "reset", "description": "Сбросить настройки"},
         ])
         while True:

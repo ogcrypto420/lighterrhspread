@@ -845,6 +845,7 @@ class App:
                 f"глубина — меньшая из сторон в ±{s.band:g}%")
 
     def status_merged(self, u: User, top: int) -> str:
+        """Core включён: по каждой акции блок из строк RH и CORE друг под другом."""
         s = u.s
         by_base: dict[str, dict[str, Metrics]] = {}
         for m in self.markets.values():
@@ -856,19 +857,26 @@ class App:
         if not by_base:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))
-
-        def cell(met: Metrics | None) -> str:
-            if met is None:
-                return "—"
-            return ("✅" if passes(met, s) else "") + f"{met.spread_pct:.4f}"
-
-        lines = [f"{'Пара':<7}{'RH':>10}{'CORE':>10}"]
+        lines = [f"{'Пара':<6}{'':5}{'Спред%':>9}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
+        ok = 0
         for base, mets in rows[:top]:
-            lines.append(f"{base[:7]:<7}{cell(mets.get('rh')):>10}{cell(mets.get('core')):>10}")
-        return (f"📊 <b>Топ-{min(top, len(rows))} по спреду, RH и CORE</b>\n"
+            first = True
+            for ex, tag in (("rh", "RH"), ("core", "CORE")):
+                met = mets.get(ex)
+                name = base[:6] if first else ""
+                first = False
+                if met is None:
+                    lines.append(f"{name:<6}{tag:<5}{'—':>9}")
+                    continue
+                good = passes(met, s)
+                ok += good
+                imp = "∞" if math.isinf(met.impact) else f"{met.impact:.3f}"
+                lines.append(f"{name:<6}{tag:<5}{met.spread_pct:>9.4f}{met.spread_ticks:>4g}"
+                             f"{imp:>7}{fmt_usd(met.depth):>6}" + (" ✅" if good else ""))
+        return (f"📊 <b>Топ-{min(top, len(rows))} акций по спреду, RH и CORE</b> (✅ проходят фильтры: {ok})\n"
                 f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
-                "Спред в %, ✅ — проходит все твои фильтры, — — пары нет на бирже.\n"
-                "Подробно с impact и глубиной: /status_rh · /status_core")
+                f"Impact — проскальзывание на {fmt_usd(s.size)}, %, глубина — меньшая из сторон в ±{s.band:g}%, "
+                "— — пары нет на бирже.\nТолько одна биржа: /status_rh · /status_core")
 
     def welcome_text(self, u: User) -> str:
         s = u.s

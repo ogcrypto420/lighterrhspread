@@ -14,6 +14,7 @@ concurrency:
 
 permissions:
   contents: write   # только для keepalive-коммита раз в ~45 дней
+  actions: write    # чтобы поставить в очередь следующий запуск
 
 jobs:
   bot:
@@ -35,6 +36,13 @@ jobs:
           path: data
           key: bot-state-${{ github.run_id }}
           restore-keys: bot-state-
+
+      - name: Queue next run
+        # Сразу ставим в очередь следующий запуск: он стартует, как только этот закончится.
+        # Расписание (cron) у GitHub часто опаздывает или пропускается — это основная страховка.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --ref "${{ github.ref_name }}" -R "${{ github.repository }}" || true
 
       - name: Keep schedule alive
         # GitHub отключает расписание, если в репозитории 60 дней не было коммитов

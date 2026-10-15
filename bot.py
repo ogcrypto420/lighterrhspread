@@ -28,6 +28,11 @@ from pathlib import Path
 
 import aiohttp
 
+try:  # картинка для /status (если Pillow нет — бот пришлёт текст)
+    import status_image
+except Exception:  # noqa: BLE001
+    status_image = None
+
 HERE = Path(__file__).resolve().parent
 log = logging.getLogger("lighter-bot")
 
@@ -569,6 +574,21 @@ class App:
             if len(targets) > 1:
                 await asyncio.sleep(0.05)  # лимит Telegram ~30 сообщений/с
 
+    async def send_photo(self, chat_id: str, png: bytes, caption: str) -> bool:
+        if not TG_TOKEN:
+            return False
+        form = aiohttp.FormData()
+        form.add_field("chat_id", str(chat_id))
+        form.add_field("caption", caption)
+        form.add_field("parse_mode", "HTML")
+        form.add_field("photo", png, filename="status.png", content_type="image/png")
+        async with self.http.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendPhoto", data=form,
+                                  timeout=aiohttp.ClientTimeout(total=60)) as r:
+            data = await r.json(content_type=None)
+        if not data.get("ok"):
+            log.warning("Telegram sendPhoto: %s", data)
+        return bool(data.get("ok"))
+
     async def broadcast(self, text: str) -> None:
         await self.send(text, [cid for cid, u in self.users.items() if not u.paused])
 
@@ -849,6 +869,47 @@ class App:
                    f"глубина — меньшая из сторон в ±{s.band:g}%")
         return "\n".join(out)
 
+    def status_image(self, u: User, top: int, only: str | None) -> tuple[bytes, str] | None:
+        """PNG-таблица /status и подпись к ней; None — если рисовать нечего или нет Pillow."""
+        if status_image is None:
+            return None
+        s = u.s
+        top = min(top, 25)
+        merged = only is None and s.venue == "both" and "core" in EXCHANGES
+        groups = []
+        if merged:
+            by_base: dict[str, dict[str, Metrics]] = {}
+            for m in self.markets.values():
+                if m.mtype == "perp" and (met := self.metrics_for(m, s)):
+                    by_base.setdefault(m.base, {})[m.ex] = met
+            rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))[:top]
+            for base, mets in rows:
+                cells = []
+                for ex, tag in (("rh", "RH"), ("core", "CORE")):
+                    met = mets.get(ex)
+                    cells.append(status_image.Cell(tag, None, None, None, None) if met is None else
+                                 status_image.Cell(tag, met.spread_pct, met.spread_ticks, met.impact,
+                                                   met.depth, passes(met, s)))
+                groups.append(status_image.Group(base, cells))
+            title = f"Топ-{len(groups)} акций по спреду · RH и CORE"
+            caption = "📊 Подробно по одной бирже: /status_rh · /status_core · текстом: /status_text"
+        else:
+            ex = only or "rh"
+            rows = sorted(((m, met) for m in self.markets.values()
+                           if m.ex == ex and (met := self.metrics_for(m, s))),
+                          key=lambda r: (r[1].spread_pct, r[1].impact))[:top]
+            tag = EXCHANGES[ex][0]
+            for m, met in rows:
+                groups.append(status_image.Group(m.symbol, [status_image.Cell(
+                    tag, met.spread_pct, met.spread_ticks, met.impact, met.depth, passes(met, s))]))
+            title = f"Топ-{len(groups)} по спреду · {tag}"
+            caption = "📊 Текстом: /status_text"
+        if not groups:
+            return None
+        png = status_image.render_status(title, groups, spread=s.spread, impact=s.impact, depth=s.depth,
+                                         size=s.size, band=s.band)
+        return png, caption
+
     def status_merged(self, u: User, top: int) -> str:
         """Core включён: по каждой акции блок из строк RH и CORE друг под другом."""
         s = u.s
@@ -941,14 +1002,24 @@ class App:
             reply = self.welcome_text(u)
         elif cmd == "/help":
             reply = self.help_text(chat_id)
-        elif cmd in ("/status", "/status_rh", "/status_core"):
+        elif cmd in ("/status", "/status_rh", "/status_core", "/status_text"):
             only = {"/status_rh": "rh", "/status_core": "core"}.get(cmd)
+            as_text = cmd == "/status_text"
             for a in args:
                 if a.lower() in ("rh", "core"):
                     only = a.lower()
+                if a.lower() in ("text", "текст"):
+                    as_text = True
             if only == "core" and "core" not in EXCHANGES:
                 only = "rh"
             num = next((int(a) for a in args if a.isdigit()), 15)
+            if not as_text:
+                try:
+                    pic = self.status_image(u, num, only)
+                    if pic and await self.send_photo(chat_id, pic[0], pic[1]):
+                        return
+                except Exception:  # noqa: BLE001
+                    log.exception("Не удалось нарисовать /status — шлю текстом")
             reply = self.status_text(u, min(num, 50), only)
         elif cmd == "/settings":
             reply = self.settings_text(u)

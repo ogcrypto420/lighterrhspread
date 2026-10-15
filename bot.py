@@ -71,6 +71,14 @@ TG_TOKEN = env_str("TG_TOKEN")
 TG_CHAT_IDS = [c.strip() for c in env_str("TG_CHAT_ID").split(",") if c.strip()]
 API_URL = env_str("API_URL", "https://api.rh.lighter.xyz").rstrip("/")
 WS_URL = env_str("WS_URL", "wss://api.rh.lighter.xyz/stream?readonly=true")
+# Основной Lighter («core») — отдельная биржа, мониторится дополнительно
+ENABLE_CORE = env_bool("ENABLE_CORE", True)
+CORE_API_URL = env_str("CORE_API_URL", "https://mainnet.zklighter.elliot.ai").rstrip("/")
+CORE_WS_URL = env_str("CORE_WS_URL", "wss://mainnet.zklighter.elliot.ai/stream?readonly=true")
+# код биржи → (название в сообщениях, REST, WebSocket)
+EXCHANGES: dict[str, tuple[str, str, str]] = {"rh": ("RH", API_URL, WS_URL)}
+if ENABLE_CORE:
+    EXCHANGES["core"] = ("Core", CORE_API_URL, CORE_WS_URL)
 
 INCLUDE_ETF = env_bool("INCLUDE_ETF", False)              # SPY, QQQ, SOXL, USO, SLV, SGOV
 INCLUDE_PREIPO = env_bool("INCLUDE_PREIPO", True)        # OPENAI, ANTHROPIC, SHEIN …
@@ -92,12 +100,25 @@ MAX_RUNTIME_MIN = env_float("MAX_RUNTIME_MIN", 0)
 
 # Ручная разметка того, что нельзя надёжно отличить от акций по параметрам рынка.
 # Можно дополнять через .env (через запятую).
-ETF_SYMBOLS = {"SPY", "QQQ", "SOXL", "USO", "SLV", "SGOV", "IWM", "DIA", "TQQQ", "GLD"} | env_set("EXTRA_ETF")
-PREIPO_SYMBOLS = {"OPENAI", "ANTHROPIC", "SHEIN"} | env_set("EXTRA_PREIPO")
-COMMODITY_SYMBOLS = {"XAU", "XAG", "XPT", "XPD", "WTI", "BRENT", "NATGAS", "COPPER"} | env_set("EXTRA_COMMODITIES")
+ETF_SYMBOLS = {
+    "SPY", "QQQ", "SOXL", "USO", "SLV", "SGOV", "IWM", "DIA", "TQQQ", "SQQQ", "GLD", "EWY", "EWJ", "EWZ", "EWT",
+    "FXI", "KWEB", "URA", "KORU", "ARKK", "XLE", "XLF", "XLK", "GDX", "GDXJ", "TLT", "HYG", "SMH", "SOXX", "VTI",
+    "VOO", "IBIT", "ETHA", "BITO", "UVXY", "SOXS", "TNA", "YINN", "NVDL", "TSLL", "MSTU", "CONL", "UNG", "COPX",
+} | env_set("EXTRA_ETF")
+INDEX_SYMBOLS = {
+    "US500", "US100", "US30", "US2000", "SPX", "NDX", "DJI", "VIX", "JP225", "DE40", "UK100", "HK50", "KR200",
+    "KOSPI", "NIKKEI", "STONK", "DXY", "US10Y", "US02Y", "US2Y", "US30Y",
+} | env_set("EXTRA_INDEX")
+PREIPO_SYMBOLS = {"OPENAI", "ANTHROPIC", "SHEIN", "SPACEX", "XAI", "STRIPE", "DATABRICKS", "ANDURIL",
+                  "PERPLEXITY", "KRAKEN"} | env_set("EXTRA_PREIPO")
+COMMODITY_SYMBOLS = {"XAU", "XAG", "XPT", "XPD", "WTI", "BRENT", "NATGAS", "NG", "COPPER", "XCU",
+                     "CORN", "WHEAT", "SOY"} | env_set("EXTRA_COMMODITIES")
+# одна и та же акция может называться на биржах по-разному — для сравнения RH ↔ Core
+ALIASES = {"SKHYNIX": "SKHY", "SPACEX": "SPCX"}
 EXTRA_STOCKS = env_set("EXTRA_STOCKS")       # принудительно считать акцией
 EXTRA_CRYPTO = env_set("EXTRA_CRYPTO")       # принудительно считать криптой
-FIAT = {"USD", "EUR", "JPY", "GBP", "CHF", "AUD", "CAD", "KRW", "CNH", "MXN", "BRL", "INR", "TRY", "NZD"}
+FIAT = {"USD", "EUR", "JPY", "GBP", "CHF", "AUD", "CAD", "KRW", "CNH", "CNY", "MXN", "BRL", "INR", "TRY", "NZD",
+        "HKD", "SGD", "ZAR", "SEK", "NOK", "PLN", "TWD", "IDR", "PHP", "THB", "ILS", "HUF", "CZK", "DKK"}
 
 
 @dataclass
@@ -112,6 +133,10 @@ class Settings:
     cooldown: float = env_float("COOLDOWN_MIN", 15)         # пауза между алертами по одной паре, мин
     grace: float = env_float("LOST_GRACE_SECONDS", 10)      # через сколько сек плохого стакана пара «ушла»
     notify_lost: bool = env_bool("NOTIFY_LOST", True)       # слать ли «пара ушла»
+    venue: str = env_str("VENUE", "both").lower()           # какие биржи: rh / core / both
+
+    def wants(self, m: "Market") -> bool:
+        return self.venue in ("both", m.ex)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -141,7 +166,9 @@ SETTING_HELP = {
     "cooldown": "пауза между алертами по одной паре, мин",
     "grace": "через сколько секунд слать «🔴 пара ушла»",
     "notify_lost": "слать «🔴 пара ушла» (on/off)",
+    "venue": "какие биржи смотреть: rh, core или both",
 }
+VENUES = {"rh": "rh", "robinhood": "rh", "core": "core", "lighter": "core", "both": "both", "all": "both", "все": "both"}
 
 
 # ───────────────────────────── рынки ─────────────────────────────
@@ -150,11 +177,20 @@ SETTING_HELP = {
 class Market:
     id: int
     symbol: str          # как на бирже: "NVDA" или "NVDA/USDG"
-    base: str            # "NVDA"
-    kind: str            # stock / etf / preipo / commodity / fx / crypto
+    base: str            # "NVDA" (для сопоставления между биржами)
+    kind: str            # stock / etf / preipo / commodity / fx / index / crypto / other
     mtype: str           # perp / spot
     price_decimals: int
     last_price: float
+    ex: str = "rh"       # rh / core
+
+    @property
+    def key(self) -> str:
+        return f"{self.ex}:{self.id}"
+
+    @property
+    def ex_name(self) -> str:
+        return EXCHANGES.get(self.ex, (self.ex,))[0]
 
     @property
     def tick(self) -> float:
@@ -162,7 +198,8 @@ class Market:
 
     @property
     def label(self) -> str:
-        return self.symbol if self.mtype == "perp" else f"{self.symbol} (спот)"
+        spot = " (спот)" if self.mtype == "spot" else ""
+        return f"{self.symbol}{spot} · {self.ex_name}"
 
 
 def classify_perp(m: dict) -> str:
@@ -177,19 +214,30 @@ def classify_perp(m: dict) -> str:
         return "etf"
     if sym in PREIPO_SYMBOLS:
         return "preipo"
+    if sym in INDEX_SYMBOLS:
+        return "index"
     if len(sym) == 6 and sym[:3] in FIAT and sym[3:] in FIAT:
         return "fx"
-    # На Lighter у крипто-перпов базовая ставка 0.0100, у RWA (акции/ETF/сырьё) — 0.0032.
-    # Это самый надёжный признак, который есть в API (отдельного поля «класс актива» нет).
-    rate = str(m.get("base_interest_rate", ""))
+    # Отдельного поля «класс актива» в API нет. Признак по параметрам рынка:
+    # базовая ставка 0.0100 — крипта, 0.0032 — RWA (акции/ETF/сырьё/FX), остальное — прочее.
     try:
-        return "crypto" if float(rate) >= 0.0075 else "stock"
-    except ValueError:
+        rate = float(m.get("base_interest_rate", ""))
+        mult = float(m.get("funding_premium_multiplier", 50))
+    except (TypeError, ValueError):
+        return "other"
+    if rate >= 0.0075:
         return "crypto"
+    if abs(rate - 0.0032) > 1e-6:
+        return "other"
+    if mult <= 1:          # у pre-IPO на Lighter множитель премии фандинга 1
+        return "preipo"
+    if mult >= 100:        # нетипичный RWA (например, корзины) — не трогаем
+        return "other"
+    return "stock"
 
 
-def parse_markets(data: dict) -> dict[int, Market]:
-    perps: dict[int, Market] = {}
+def parse_markets(data: dict, ex: str = "rh") -> dict[str, Market]:
+    perps: dict[str, Market] = {}
     kind_by_base: dict[str, str] = {}
     for m in data.get("order_book_details") or []:
         kind = classify_perp(m)
@@ -197,23 +245,23 @@ def parse_markets(data: dict) -> dict[int, Market]:
         kind_by_base[sym] = kind
         if m.get("status") != "active" or m.get("is_frozen"):
             continue
-        perps[int(m["market_id"])] = Market(
-            int(m["market_id"]), sym, sym, kind, "perp",
-            int(m.get("price_decimals", 2)), float(m.get("last_trade_price") or 0))
-    spots: dict[int, Market] = {}
+        mk = Market(int(m["market_id"]), sym, ALIASES.get(sym, sym), kind, "perp",
+                    int(m.get("price_decimals", 2)), float(m.get("last_trade_price") or 0), ex)
+        perps[mk.key] = mk
+    spots: dict[str, Market] = {}
     for m in data.get("spot_order_book_details") or []:
         sym = m["symbol"].upper()
         base = sym.split("/")[0]
         kind = "stock" if base in EXTRA_STOCKS else kind_by_base.get(base, "crypto")
         if m.get("status") != "active" or m.get("is_frozen"):
             continue
-        spots[int(m["market_id"])] = Market(
-            int(m["market_id"]), sym, base, kind, "spot",
-            int(m.get("price_decimals", 2)), float(m.get("last_trade_price") or 0))
+        mk = Market(int(m["market_id"]), sym, ALIASES.get(base, base), kind, "spot",
+                    int(m.get("price_decimals", 2)), float(m.get("last_trade_price") or 0), ex)
+        spots[mk.key] = mk
     return {**perps, **spots}
 
 
-def select_markets(all_markets: dict[int, Market]) -> dict[int, Market]:
+def select_markets(all_markets: dict[str, Market]) -> dict[str, Market]:
     kinds = {"stock"}
     if INCLUDE_ETF:
         kinds.add("etf")
@@ -230,7 +278,7 @@ def select_markets(all_markets: dict[int, Market]) -> dict[int, Market]:
                 continue
         elif m.kind not in kinds:
             continue
-        if m.base in EXCLUDE_SYMBOLS or m.symbol in EXCLUDE_SYMBOLS:
+        if m.base in EXCLUDE_SYMBOLS or m.symbol in EXCLUDE_SYMBOLS or m.key.upper() in EXCLUDE_SYMBOLS:
             continue
         out[mid] = m
     return out
@@ -385,20 +433,21 @@ class User:
     s: Settings = field(default_factory=Settings)
     paused: bool = False
     joined: float = field(default_factory=time.time)
-    pairs: dict[int, PairState] = field(default_factory=dict)
+    pairs: dict[str, PairState] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {"s": self.s.to_dict(), "paused": self.paused, "joined": self.joined,
-                "pairs": {str(mid): {"alerted": st.alerted, "last_alert": st.last_alert}
-                          for mid, st in self.pairs.items() if st.alerted or st.last_alert}}
+                "pairs": {key: {"alerted": st.alerted, "last_alert": st.last_alert}
+                          for key, st in self.pairs.items() if st.alerted or st.last_alert}}
 
     @classmethod
     def from_dict(cls, chat_id: str, d: dict) -> "User":
         u = cls(chat_id, Settings.from_dict(d.get("s") or {}), bool(d.get("paused")),
                 float(d.get("joined") or time.time()))
-        for mid, st in (d.get("pairs") or {}).items():
-            u.pairs[int(mid)] = PairState(alerted=bool(st.get("alerted")),
-                                          last_alert=float(st.get("last_alert", 0)))
+        for key, st in (d.get("pairs") or {}).items():
+            key = f"rh:{key}" if str(key).isdigit() else str(key)   # старый формат — только RH
+            u.pairs[key] = PairState(alerted=bool(st.get("alerted")),
+                                     last_alert=float(st.get("last_alert", 0)))
         return u
 
 
@@ -409,14 +458,14 @@ def is_owner(chat_id: str) -> bool:
 class App:
     def __init__(self) -> None:
         self.defaults = Settings()
-        self.markets: dict[int, Market] = {}
-        self.books: dict[int, Book] = {}
+        self.markets: dict[str, Market] = {}     # ключ "rh:15" / "core:115"
+        self.books: dict[str, Book] = {}
         self.users: dict[str, User] = {}
         self.feeds: list[asyncio.Task] = []
         self.http: aiohttp.ClientSession | None = None
         self.started = time.time()
         self.tg_offset = 0
-        self.known_ids: set[int] = set()
+        self.known_ids: set[str] = set()
         self.restored = self.load_state()
         for cid in TG_CHAT_IDS:  # владелец подписан всегда
             self.users.setdefault(cid, User(cid))
@@ -433,11 +482,11 @@ class App:
             if "users" not in data and TG_CHAT_IDS:  # формат однопользовательской версии
                 owner = User(TG_CHAT_IDS[0], paused=bool(data.get("paused")))
                 for mid, st in (data.get("pairs") or {}).items():
-                    owner.pairs[int(mid)] = PairState(alerted=bool(st.get("alerted")),
+                    owner.pairs[f"rh:{mid}"] = PairState(alerted=bool(st.get("alerted")),
                                                       last_alert=float(st.get("last_alert", 0)))
                 self.users[owner.chat_id] = owner
             self.tg_offset = int(data.get("tg_offset", 0))
-            self.known_ids = {int(i) for i in data.get("known_ids", [])}
+            self.known_ids = {f"rh:{i}" if str(i).isdigit() else str(i) for i in data.get("known_ids", [])}
             log.info("Состояние восстановлено: пользователей %d", len(self.users))
             return True
         except Exception as e:  # noqa: BLE001
@@ -524,17 +573,29 @@ class App:
         await self.send(text, [cid for cid, u in self.users.items() if not u.paused])
 
     # ---------- рынки ----------
-    async def fetch_markets(self) -> dict[int, Market]:
-        async with self.http.get(f"{API_URL}/api/v1/orderBookDetails",
-                                 timeout=aiohttp.ClientTimeout(total=20)) as r:
-            r.raise_for_status()
-            return parse_markets(await r.json(content_type=None))
+    async def fetch_markets(self) -> dict[str, Market]:
+        """Рынки со всех бирж. Если одна биржа не ответила — оставляем её прежний список."""
+        out: dict[str, Market] = {}
+        errors = 0
+        for ex, (_, api, _) in EXCHANGES.items():
+            try:
+                async with self.http.get(f"{api}/api/v1/orderBookDetails",
+                                         timeout=aiohttp.ClientTimeout(total=30)) as r:
+                    r.raise_for_status()
+                    out.update(select_markets(parse_markets(await r.json(content_type=None), ex)))
+            except Exception as e:  # noqa: BLE001
+                errors += 1
+                log.warning("Не удалось получить рынки %s: %s", ex, e)
+                out.update({k: m for k, m in self.markets.items() if m.ex == ex})
+        if errors == len(EXCHANGES):
+            raise RuntimeError("ни одна биржа не ответила")
+        return out
 
     async def markets_loop(self) -> None:
         first = True
         while True:
             try:
-                selected = select_markets(await self.fetch_markets())
+                selected = await self.fetch_markets()
                 old_ids, new_ids = set(self.markets), set(selected)
                 added = [selected[i] for i in new_ids - old_ids]
                 self.markets = selected
@@ -561,19 +622,25 @@ class App:
             await asyncio.sleep(MARKETS_REFRESH_SEC)
 
     def unreachable_note(self, s: Settings) -> str:
-        bad = [m for m in self.markets.values() if min_spread_pct(m, m.last_price) > s.spread]
+        bad = [m for m in self.markets.values() if s.wants(m) and min_spread_pct(m, m.last_price) > s.spread]
         if not bad:
             return ""
         return (f"⚠️ У {len(bad)} пар даже спред в 1 тик больше {s.spread:g}% (шаг цены $0.01 при низкой цене), "
                 "с текущим порогом они не пройдут никогда: " +
-                ", ".join(f"{html.escape(m.base)} ({min_spread_pct(m, m.last_price):.4f}%)"
+                ", ".join(f"{html.escape(m.base)}·{m.ex_name} ({min_spread_pct(m, m.last_price):.4f}%)"
                           for m in sorted(bad, key=lambda m: m.base)) +
                 "\nЧтобы ловить и их: <code>/set spread 0.005</code>")
 
     def startup_text(self) -> str:
         ms = sorted(self.markets.values(), key=lambda m: m.label)
-        parts = [f"🚀 <b>Мониторинг Lighter RH запущен</b>\nПар: {len(ms)} — " +
-                 ", ".join(html.escape(m.label) for m in ms)]
+        return f"🚀 <b>Мониторинг запущен</b>\n\n" + self.pairs_text()
+
+    def pairs_text(self) -> str:
+        parts = []
+        for ex, (name, _, _) in EXCHANGES.items():
+            ms = sorted((m for m in self.markets.values() if m.ex == ex), key=lambda m: m.symbol)
+            parts.append(f"<b>{name}</b> — {len(ms)} пар:\n" +
+                         ", ".join(html.escape(m.symbol + (" (спот)" if m.mtype == "spot" else "")) for m in ms))
         return "\n\n".join(parts)
 
     # ---------- WebSocket ----------
@@ -581,27 +648,29 @@ class App:
         for t in self.feeds:
             t.cancel()
         self.feeds = []
-        ids = sorted(self.markets)
-        for i in range(0, len(ids), MARKETS_PER_WS):
-            chunk = ids[i:i + MARKETS_PER_WS]
-            self.feeds.append(asyncio.create_task(self.feed(chunk), name=f"feed-{i}"))
+        for ex in EXCHANGES:
+            ids = sorted(m.id for m in self.markets.values() if m.ex == ex)
+            for i in range(0, len(ids), MARKETS_PER_WS):
+                chunk = ids[i:i + MARKETS_PER_WS]
+                self.feeds.append(asyncio.create_task(self.feed(ex, chunk), name=f"feed-{ex}-{i}"))
 
-    async def feed(self, ids: list[int]) -> None:
+    async def feed(self, ex: str, ids: list[int]) -> None:
+        ws_url = EXCHANGES[ex][2]
         backoff = 1
         while True:
             try:
-                async with self.http.ws_connect(WS_URL, heartbeat=None, compress=15,
+                async with self.http.ws_connect(ws_url, heartbeat=None, compress=15,
                                                 max_msg_size=0, autoping=True) as ws:
                     for mid in ids:
-                        self.books[mid] = Book()
+                        self.books[f"{ex}:{mid}"] = Book()
                         await ws.send_json({"type": "subscribe", "channel": f"order_book/{mid}"})
-                    log.info("WS подключён, подписка на %d рынков", len(ids))
+                    log.info("WS %s подключён, подписка на %d рынков", ex, len(ids))
                     backoff = 1
                     pinger = asyncio.create_task(self._ping(ws))
                     try:
                         async for msg in ws:
                             if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self.on_ws(ws, json.loads(msg.data))
+                                await self.on_ws(ws, ex, json.loads(msg.data))
                             elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
                     finally:
@@ -609,10 +678,10 @@ class App:
             except asyncio.CancelledError:
                 raise
             except Exception as e:  # noqa: BLE001
-                log.warning("WS ошибка: %s", e)
+                log.warning("WS %s ошибка: %s", ex, e)
             for mid in ids:
-                if mid in self.books:
-                    self.books[mid].reset()
+                if f"{ex}:{mid}" in self.books:
+                    self.books[f"{ex}:{mid}"].reset()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
@@ -622,16 +691,16 @@ class App:
             await asyncio.sleep(50)  # сервер рвёт соединение после 2 минут тишины
             await ws.send_json({"type": "ping"})
 
-    async def on_ws(self, ws, msg: dict) -> None:
+    async def on_ws(self, ws, ex: str, msg: dict) -> None:
         t = msg.get("type", "")
         if t in ("subscribed/order_book", "update/order_book"):
             try:
                 mid = int(str(msg.get("channel", "")).split(":")[1])
             except (IndexError, ValueError):
                 return
-            book = self.books.setdefault(mid, Book())
+            book = self.books.setdefault(f"{ex}:{mid}", Book())
             if not book.apply(msg.get("order_book") or {}, snapshot=t.startswith("subscribed")):
-                log.info("Пропуск обновлений по рынку %s — пересинхронизация", mid)
+                log.info("Пропуск обновлений по рынку %s:%s — пересинхронизация", ex, mid)
                 await ws.send_json({"type": "unsubscribe", "channel": f"order_book/{mid}"})
                 await ws.send_json({"type": "subscribe", "channel": f"order_book/{mid}"})
         elif t == "error" or "error" in msg:
@@ -639,10 +708,10 @@ class App:
 
     # ---------- оценка и алерты ----------
     def metrics_for(self, m: Market, s: Settings, cache: dict | None = None) -> Metrics | None:
-        key = (m.id, s.size, s.band)
+        key = (m.key, s.size, s.band)
         if cache is not None and key in cache:
             return cache[key]
-        book = self.books.get(m.id)
+        book = self.books.get(m.key)
         met = compute_metrics(book, m.tick, s.size, s.band) if book and book.ready else None
         if cache is not None:
             cache[key] = met
@@ -658,8 +727,10 @@ class App:
             s = u.s
             good_new, lost = [], []
             for m in self.markets.values():
+                if not s.wants(m):
+                    continue
                 met = self.metrics_for(m, s, cache)
-                st = u.pairs.setdefault(m.id, PairState())
+                st = u.pairs.setdefault(m.key, PairState())
                 if passes(met, s):
                     st.bad_since = None
                     if st.ok_since is None:
@@ -667,7 +738,7 @@ class App:
                     if (not st.alerted and now - st.ok_since >= s.hold
                             and now - st.last_alert >= s.cooldown * 60):
                         st.alerted, st.last_alert = True, now
-                        good_new.append((m, met, now - st.ok_since))
+                        good_new.append((m, met, now - st.ok_since, self.twin_line(m, s, cache)))
                 else:
                     st.ok_since = None
                     if st.alerted:
@@ -679,15 +750,28 @@ class App:
                 out[cid] = (good_new, lost)
         return out
 
+    def twin_line(self, m: Market, s: Settings, cache: dict | None = None) -> str:
+        """Та же акция на другой бирже — для сравнения в алерте."""
+        for o in self.markets.values():
+            if o.ex != m.ex and o.base == m.base and o.mtype == m.mtype:
+                om = self.metrics_for(o, s, cache)
+                if om is None:
+                    return f"На {o.ex_name}: стакан недоступен"
+                ok = " ✅" if passes(om, s) else ""
+                diff = (om.mid / self.metrics_for(m, s, cache).mid - 1) * 100 if self.metrics_for(m, s, cache) else 0
+                return (f"На {o.ex_name}: спред {fmt_pct(om.spread_pct)} ({om.spread_ticks:g} тик.), "
+                        f"impact {fmt_pct(om.impact)}, цена {diff:+.3f}%{ok}")
+        return ""
+
     @staticmethod
-    def good_text(m: Market, met: Metrics, held: float, s: Settings) -> str:
+    def good_text(m: Market, met: Metrics, held: float, s: Settings, twin: str = "") -> str:
         return (f"🟢 <b>{html.escape(m.label)}</b> — узкий спред, плотный стакан\n"
                 f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · "
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
                 f"Проскальзывание на {fmt_usd(s.size)}: buy {fmt_pct(met.buy_impact)} / "
                 f"sell {fmt_pct(met.sell_impact)}\n"
                 f"Глубина ±{s.band:g}%: bid {fmt_usd(met.depth_bid)} / ask {fmt_usd(met.depth_ask)}\n"
-                f"Держится {held:.0f} с")
+                f"Держится {held:.0f} с" + (f"\n{twin}" if twin else ""))
 
     @staticmethod
     def lost_text(m: Market, met: Metrics | None, s: Settings) -> str:
@@ -710,7 +794,7 @@ class App:
                     u = self.users.get(cid)
                     if not u:
                         continue
-                    parts = [self.good_text(m, met, held, u.s) for m, met, held in good_new]
+                    parts = [self.good_text(m, met, held, u.s, twin) for m, met, held, twin in good_new]
                     if u.s.notify_lost:
                         parts += [self.lost_text(m, met, u.s) for m, met in lost]
                     if parts:
@@ -728,41 +812,45 @@ class App:
                 f"impact ≤ {s.impact:g}% на size {fmt_usd(s.size)}\n"
                 f"depth ≥ {fmt_usd(s.depth)} на сторону в band ±{s.band:g}%\n"
                 f"hold {s.hold:g} с · cooldown {s.cooldown:g} мин\n"
-                f"grace {s.grace:g} с · notify_lost {'on' if s.notify_lost else 'off'}"
+                f"grace {s.grace:g} с · notify_lost {'on' if s.notify_lost else 'off'}\n"
+                f"venue {s.venue} ({ {'both': 'RH + Core', 'rh': 'только RH', 'core': 'только Core'}.get(s.venue, s.venue) })"
                 + ("\n\n⏸ <b>Алерты на паузе</b> — /resume" if u.paused else ""))
 
     def status_text(self, u: User, top: int = 15) -> str:
         s = u.s
-        rows = [(m, met) for m in self.markets.values() if (met := self.metrics_for(m, s))]
+        rows = [(m, met) for m in self.markets.values() if s.wants(m) and (met := self.metrics_for(m, s))]
         if not rows:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows.sort(key=lambda r: (r[1].spread_pct, r[1].impact))
-        lines = [f"{'Пара':<10}{'Спред%':>8}{'Тик':>4}{'Impact%':>9}{'Глуб.':>8}"]
+        lines = [f"{'Пара':<11}{'Спред%':>7}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
         for m, met in rows[:top]:
             mark = "✅" if passes(met, s) else "  "
-            imp = "∞" if math.isinf(met.impact) else f"{met.impact:.4f}"
-            lines.append(f"{mark}{m.base[:8]:<8}{met.spread_pct:>8.4f}{met.spread_ticks:>4g}"
-                         f"{imp:>9}{fmt_usd(met.depth):>8}")
+            imp = "∞" if math.isinf(met.impact) else f"{met.impact:.3f}"
+            tag = "R" if m.ex == "rh" else "C"
+            lines.append(f"{mark}{m.symbol[:7]:<7}{tag:>2}{met.spread_pct:>7.4f}{met.spread_ticks:>4g}"
+                         f"{imp:>7}{fmt_usd(met.depth):>6}")
         ok = sum(1 for _, met in rows if passes(met, s))
         return (f"📊 <b>Топ-{min(top, len(rows))} по спреду</b> (проходят твои фильтры: {ok}/{len(rows)})\n"
                 f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
-                f"Impact — проскальзывание на {fmt_usd(s.size)}, глубина — меньшая из сторон в ±{s.band:g}%")
+                f"R — Lighter RH, C — Lighter Core. Impact — проскальзывание на {fmt_usd(s.size)}, %, "
+                f"глубина — меньшая из сторон в ±{s.band:g}%")
 
     def welcome_text(self, u: User) -> str:
         s = u.s
-        return ("👋 <b>Привет!</b> Я слежу за стаканами всех акций и pre-IPO на Lighter (Robinhood Chain) "
+        return ("👋 <b>Привет!</b> Я слежу за стаканами всех акций и pre-IPO на Lighter Robinhood и основном Lighter (Core) "
                 "и пишу, когда по паре можно зайти почти без потерь на спреде.\n\n"
                 "Каждую секунду проверяю у каждой пары:\n"
                 f"▫️ спред ≤ {s.spread:g}%\n"
                 f"▫️ рыночная заявка на {fmt_usd(s.size)} сдвинет цену не больше чем на {s.impact:g}%\n"
                 f"▫️ в ±{s.band:g}% от цены стоит минимум {fmt_usd(s.depth)} на покупку и на продажу\n\n"
                 f"Если всё держится {s.hold:g} с — пришлю 🟢 с цифрами, когда уйдёт — 🔴.\n\n"
+                "В алерте видно и вторую биржу — где по этой акции сейчас уже спред.\n\n"
                 "Ты уже подписан ✅ Настрой под себя: /help")
 
     def help_text(self, chat_id) -> str:
         sets = "\n".join(f"<code>{k}</code> — {v}" for k, v in SETTING_HELP.items())
         return ("<b>Настройки</b> — командой <code>/set</code>, например:\n"
-                "<code>/set spread 0.005</code>\n<code>/set size 10000</code>\n\n"
+                "<code>/set spread 0.005</code>\n<code>/set size 10000</code>\n<code>/set venue rh</code>\n\n"
                 f"{sets}\n\n"
                 "Можно несколько команд одним сообщением, каждую с новой строки.\n\n"
                 "<b>Команды</b>\n"
@@ -808,8 +896,7 @@ class App:
             if note := self.unreachable_note(u.s):
                 reply += "\n\n" + note
         elif cmd == "/pairs":
-            reply = f"Пар: {len(self.markets)}\n" + ", ".join(
-                html.escape(m.label) for m in sorted(self.markets.values(), key=lambda m: m.label))
+            reply = self.pairs_text()
         elif cmd == "/pause":
             u.paused = True
             reply = "⏸ Алерты на паузе. /resume — включить."
@@ -836,6 +923,10 @@ class App:
         try:
             if key == "notify_lost":
                 val = raw.lower() in ("on", "1", "true", "yes", "да", "вкл")
+            elif key == "venue":
+                if raw.lower() not in VENUES:
+                    return "venue — <code>rh</code>, <code>core</code> или <code>both</code>."
+                val = VENUES[raw.lower()]
             else:
                 val = float(raw)
                 if val < 0 or math.isinf(val) or math.isnan(val):

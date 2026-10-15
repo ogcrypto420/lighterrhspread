@@ -69,6 +69,8 @@ jobs:
           SYMBOLS: ${{ vars.SYMBOLS }}
           EXCLUDE: ${{ vars.EXCLUDE }}
           ALLOW_PUBLIC: ${{ vars.ALLOW_PUBLIC }}
+          ENABLE_CORE: ${{ vars.ENABLE_CORE }}
+          VENUE: ${{ vars.VENUE }}
         run: python bot.py
 
       - name: Save state

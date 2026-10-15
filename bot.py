@@ -957,7 +957,7 @@ class App:
                 f"Если всё держится {s.hold:g} с — пришлю 🟢 с цифрами, когда уйдёт — 🔴.\n\n"
                 "Командой /core можно добавить сравнение с основным Lighter: в алертах и /status будет видно, "
                 "что с той же акцией там.\n\n"
-                "Настрой под себя: /help")
+                "Настрой под себя: /help\n\n@ogcrypter")
 
     def help_text(self, chat_id) -> str:
         sets = "\n".join(f"<code>{k}</code> — {v}" for k, v in SETTING_HELP.items())

@@ -107,7 +107,7 @@ class Settings:
     size: float = env_float("ORDER_SIZE_USD", 5000)         # размер твоей заявки, $
     impact: float = env_float("MAX_IMPACT_PCT", 0.005)      # макс. проскальзывание от лучшей цены на size, %
     band: float = env_float("DEPTH_BAND_PCT", 0.02)         # полоса вокруг mid для подсчёта глубины, %
-    depth: float = env_float("MIN_DEPTH_USD", 20000)        # мин. глубина в полосе на КАЖДОЙ стороне, $
+    depth: float = env_float("MIN_DEPTH_USD", 5000)        # мин. глубина в полосе на КАЖДОЙ стороне, $
     hold: float = env_float("HOLD_SECONDS", 10)             # сколько секунд условие должно держаться
     cooldown: float = env_float("COOLDOWN_MIN", 15)         # пауза между алертами по одной паре, мин
     grace: float = env_float("LOST_GRACE_SECONDS", 10)      # через сколько сек плохого стакана считать, что пара «ушла»

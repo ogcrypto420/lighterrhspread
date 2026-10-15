@@ -1,0 +1,78 @@
+name: Lighter alert bot
+
+# Эстафета: один запуск работает ~5ч45м и сам завершается.
+# Каждые 20 минут расписание ставит следующий запуск в очередь (concurrency ниже),
+# и он стартует сразу после окончания текущего — пауза около минуты.
+on:
+  schedule:
+    - cron: "*/20 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: lighter-bot
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # только для keepalive-коммита раз в ~45 дней
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Restore state (настройки /set, кулдауны, offset Telegram)
+        uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: bot-state-${{ github.run_id }}
+          restore-keys: bot-state-
+
+      - name: Keep schedule alive
+        # GitHub отключает расписание, если в репозитории 60 дней не было коммитов
+        run: |
+          last=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - last )) -gt $((45*86400)) ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit --allow-empty -m "keepalive"
+            git push
+          fi
+
+      - name: Run bot
+        env:
+          TG_TOKEN: ${{ secrets.TG_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DATA_DIR: data
+          MAX_RUNTIME_MIN: "345"
+          # Пороги можно задать в Settings → Secrets and variables → Actions → Variables
+          MAX_SPREAD_PCT: ${{ vars.MAX_SPREAD_PCT }}
+          ORDER_SIZE_USD: ${{ vars.ORDER_SIZE_USD }}
+          MAX_IMPACT_PCT: ${{ vars.MAX_IMPACT_PCT }}
+          DEPTH_BAND_PCT: ${{ vars.DEPTH_BAND_PCT }}
+          MIN_DEPTH_USD: ${{ vars.MIN_DEPTH_USD }}
+          HOLD_SECONDS: ${{ vars.HOLD_SECONDS }}
+          COOLDOWN_MIN: ${{ vars.COOLDOWN_MIN }}
+          NOTIFY_LOST: ${{ vars.NOTIFY_LOST }}
+          INCLUDE_ETF: ${{ vars.INCLUDE_ETF }}
+          INCLUDE_PREIPO: ${{ vars.INCLUDE_PREIPO }}
+          INCLUDE_COMMODITIES: ${{ vars.INCLUDE_COMMODITIES }}
+          INCLUDE_SPOT: ${{ vars.INCLUDE_SPOT }}
+          SYMBOLS: ${{ vars.SYMBOLS }}
+          EXCLUDE: ${{ vars.EXCLUDE }}
+        run: python bot.py
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: bot-state-${{ github.run_id }}-${{ github.run_attempt }}

@@ -82,7 +82,13 @@ EXCLUDE_SYMBOLS = env_set("EXCLUDE")
 MARKETS_REFRESH_SEC = env_float("MARKETS_REFRESH_MIN", 10) * 60
 MARKETS_PER_WS = int(env_float("MARKETS_PER_WS", 20))
 EVAL_INTERVAL_SEC = env_float("EVAL_INTERVAL_SEC", 1.0)
-SETTINGS_FILE = HERE / "settings.json"
+DATA_DIR = Path(env_str("DATA_DIR", str(HERE)))
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+SETTINGS_FILE = DATA_DIR / "settings.json"
+STATE_FILE = DATA_DIR / "state.json"   # чтобы после перезапуска не дублировать алерты
+# Через сколько минут бот сам корректно завершится (0 — работать бесконечно).
+# Нужно для GitHub Actions, где один запуск живёт максимум 6 часов.
+MAX_RUNTIME_MIN = env_float("MAX_RUNTIME_MIN", 0)
 
 # Ручная разметка того, что нельзя надёжно отличить от акций по параметрам рынка.
 # Можно дополнять через .env (через запятую).
@@ -382,6 +388,42 @@ class App:
         self.paused = False
         self.http: aiohttp.ClientSession | None = None
         self.started = time.time()
+        self.tg_offset = 0
+        self.known_ids: set[int] = set()
+        self.restored = self.load_state()
+
+    # ---------- состояние между перезапусками ----------
+    def load_state(self) -> bool:
+        if not STATE_FILE.exists():
+            return False
+        try:
+            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+            for mid, st in (data.get("pairs") or {}).items():
+                self.states[int(mid)] = PairState(alerted=bool(st.get("alerted")),
+                                                  last_alert=float(st.get("last_alert", 0)))
+            self.tg_offset = int(data.get("tg_offset", 0))
+            self.paused = bool(data.get("paused", False))
+            self.known_ids = {int(i) for i in data.get("known_ids", [])}
+            log.info("Состояние восстановлено: %d пар", len(self.states))
+            return True
+        except Exception as e:  # noqa: BLE001
+            log.warning("state.json не прочитан: %s", e)
+            return False
+
+    def save_state(self) -> None:
+        data = {
+            "pairs": {str(mid): {"alerted": st.alerted, "last_alert": st.last_alert}
+                      for mid, st in self.states.items() if st.alerted or st.last_alert},
+            "tg_offset": self.tg_offset,
+            "paused": self.paused,
+            "known_ids": sorted(self.markets) or sorted(self.known_ids),
+        }
+        try:
+            tmp = STATE_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), encoding="utf-8")
+            tmp.replace(STATE_FILE)
+        except Exception as e:  # noqa: BLE001
+            log.warning("state.json не сохранён: %s", e)
 
     # ---------- Telegram ----------
     async def tg(self, method: str, **params):
@@ -434,8 +476,14 @@ class App:
                 if new_ids != old_ids or not self.feeds:
                     self.restart_feeds()
                 if first:
-                    await self.send(self.startup_text())
                     first = False
+                    if not self.restored:
+                        await self.send(self.startup_text())
+                    else:  # тихий перезапуск: сообщаем только о листингах, появившихся пока бот не работал
+                        fresh = [m for i, m in selected.items() if self.known_ids and i not in self.known_ids]
+                        if fresh:
+                            await self.send("🆕 Новые пары в мониторинге: " +
+                                            ", ".join(html.escape(m.label) for m in fresh))
                 elif added:
                     await self.send("🆕 Новые пары в мониторинге: " +
                                     ", ".join(html.escape(m.label) for m in added))
@@ -673,7 +721,6 @@ class App:
         if not TG_TOKEN:
             log.warning("TG_TOKEN не задан — Telegram отключён, алерты пишутся только в лог")
             return
-        offset = 0
         await self.tg("setMyCommands", commands=[
             {"command": "status", "description": "Топ пар по спреду сейчас"},
             {"command": "settings", "description": "Текущие фильтры"},
@@ -684,9 +731,9 @@ class App:
         ])
         while True:
             try:
-                data = await self.tg("getUpdates", offset=offset, timeout=30, allowed_updates=["message"])
+                data = await self.tg("getUpdates", offset=self.tg_offset, timeout=30, allowed_updates=["message"])
                 for upd in (data or {}).get("result", []):
-                    offset = upd["update_id"] + 1
+                    self.tg_offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
                     text = msg.get("text") or ""
                     if text.startswith("/"):
@@ -697,9 +744,26 @@ class App:
                 log.warning("Telegram polling: %s", e)
                 await asyncio.sleep(5)
 
+    async def autosave_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            self.save_state()
+
     async def run(self) -> None:
         async with aiohttp.ClientSession() as self.http:
-            await asyncio.gather(self.markets_loop(), self.eval_loop(), self.tg_loop())
+            loops = asyncio.gather(self.markets_loop(), self.eval_loop(), self.tg_loop(), self.autosave_loop())
+            try:
+                if MAX_RUNTIME_MIN > 0:
+                    try:
+                        await asyncio.wait_for(loops, timeout=MAX_RUNTIME_MIN * 60)
+                    except asyncio.TimeoutError:
+                        log.info("Время работы (%g мин) истекло — плановое завершение", MAX_RUNTIME_MIN)
+                else:
+                    await loops
+            finally:
+                for t in self.feeds:
+                    t.cancel()
+                self.save_state()
 
 
 def main() -> None:

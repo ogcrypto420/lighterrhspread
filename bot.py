@@ -23,7 +23,7 @@ import math
 import os
 import re
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 import aiohttp
@@ -102,44 +102,45 @@ FIAT = {"USD", "EUR", "JPY", "GBP", "CHF", "AUD", "CAD", "KRW", "CNH", "MXN", "B
 
 @dataclass
 class Settings:
-    """Пороги. Меняются командой /set в Telegram и сохраняются в settings.json."""
+    """Фильтры одного пользователя. Значения по умолчанию — из .env / Variables, дальше каждый меняет через /set."""
     spread: float = env_float("MAX_SPREAD_PCT", 0.003)      # макс. спред, % от mid
-    size: float = env_float("ORDER_SIZE_USD", 5000)         # размер твоей заявки, $
+    size: float = env_float("ORDER_SIZE_USD", 5000)         # размер заявки (с плечом), $
     impact: float = env_float("MAX_IMPACT_PCT", 0.005)      # макс. проскальзывание от лучшей цены на size, %
     band: float = env_float("DEPTH_BAND_PCT", 0.02)         # полоса вокруг mid для подсчёта глубины, %
-    depth: float = env_float("MIN_DEPTH_USD", 5000)        # мин. глубина в полосе на КАЖДОЙ стороне, $
+    depth: float = env_float("MIN_DEPTH_USD", 5000)         # мин. глубина в полосе на КАЖДОЙ стороне, $
     hold: float = env_float("HOLD_SECONDS", 10)             # сколько секунд условие должно держаться
     cooldown: float = env_float("COOLDOWN_MIN", 15)         # пауза между алертами по одной паре, мин
-    grace: float = env_float("LOST_GRACE_SECONDS", 10)      # через сколько сек плохого стакана считать, что пара «ушла»
+    grace: float = env_float("LOST_GRACE_SECONDS", 10)      # через сколько сек плохого стакана пара «ушла»
     notify_lost: bool = env_bool("NOTIFY_LOST", True)       # слать ли «пара ушла»
 
-    def save(self) -> None:
-        SETTINGS_FILE.write_text(json.dumps(asdict(self), indent=2, ensure_ascii=False), encoding="utf-8")
+    def to_dict(self) -> dict:
+        return asdict(self)
 
     @classmethod
-    def load(cls) -> "Settings":
+    def from_dict(cls, data: dict) -> "Settings":
         s = cls()
-        if SETTINGS_FILE.exists():
-            try:
-                data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-                for f in fields(cls):
-                    if f.name in data:
-                        setattr(s, f.name, type(getattr(s, f.name))(data[f.name]))
-            except Exception as e:  # noqa: BLE001
-                log.warning("settings.json не прочитан: %s", e)
+        for f in fields(cls):
+            if f.name in data:
+                try:
+                    setattr(s, f.name, type(getattr(s, f.name))(data[f.name]))
+                except (TypeError, ValueError):
+                    pass
         return s
 
 
+ALLOW_PUBLIC = env_bool("ALLOW_PUBLIC", True)   # false — бот отвечает только chat id из TG_CHAT_ID
+MAX_USERS = int(env_float("MAX_USERS", 1000))
+
 SETTING_HELP = {
     "spread": "макс. спред, %",
-    "size": "размер заявки, $",
-    "impact": "макс. проскальзывание на размер, %",
-    "band": "полоса для глубины, ±%",
-    "depth": "мин. глубина на сторону, $",
-    "hold": "условие держится, сек",
-    "cooldown": "пауза между алертами, мин",
-    "grace": "«пара ушла» через, сек",
-    "notify_lost": "слать «пара ушла» (on/off)",
+    "size": "размер заявки с плечом, $",
+    "impact": "макс. проскальзывание на этот размер, %",
+    "depth": "мин. глубина стакана на каждую сторону, $",
+    "band": "полоса от цены для подсчёта глубины, ±%",
+    "hold": "сколько секунд условия держатся до алерта",
+    "cooldown": "пауза между алертами по одной паре, мин",
+    "grace": "через сколько секунд слать «🔴 пара ушла»",
+    "notify_lost": "слать «🔴 пара ушла» (on/off)",
 }
 
 
@@ -378,19 +379,48 @@ class PairState:
     last_alert: float = 0.0
 
 
+@dataclass
+class User:
+    chat_id: str
+    s: Settings = field(default_factory=Settings)
+    paused: bool = False
+    joined: float = field(default_factory=time.time)
+    pairs: dict[int, PairState] = field(default_factory=dict)
+
+    def to_dict(self) -> dict:
+        return {"s": self.s.to_dict(), "paused": self.paused, "joined": self.joined,
+                "pairs": {str(mid): {"alerted": st.alerted, "last_alert": st.last_alert}
+                          for mid, st in self.pairs.items() if st.alerted or st.last_alert}}
+
+    @classmethod
+    def from_dict(cls, chat_id: str, d: dict) -> "User":
+        u = cls(chat_id, Settings.from_dict(d.get("s") or {}), bool(d.get("paused")),
+                float(d.get("joined") or time.time()))
+        for mid, st in (d.get("pairs") or {}).items():
+            u.pairs[int(mid)] = PairState(alerted=bool(st.get("alerted")),
+                                          last_alert=float(st.get("last_alert", 0)))
+        return u
+
+
+def is_owner(chat_id: str) -> bool:
+    return str(chat_id) in TG_CHAT_IDS
+
+
 class App:
     def __init__(self) -> None:
-        self.s = Settings.load()
+        self.defaults = Settings()
         self.markets: dict[int, Market] = {}
         self.books: dict[int, Book] = {}
-        self.states: dict[int, PairState] = {}
+        self.users: dict[str, User] = {}
         self.feeds: list[asyncio.Task] = []
-        self.paused = False
         self.http: aiohttp.ClientSession | None = None
         self.started = time.time()
         self.tg_offset = 0
         self.known_ids: set[int] = set()
         self.restored = self.load_state()
+        for cid in TG_CHAT_IDS:  # владелец подписан всегда
+            self.users.setdefault(cid, User(cid))
+        self._migrate_legacy_settings()
 
     # ---------- состояние между перезапусками ----------
     def load_state(self) -> bool:
@@ -398,24 +428,39 @@ class App:
             return False
         try:
             data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            for mid, st in (data.get("pairs") or {}).items():
-                self.states[int(mid)] = PairState(alerted=bool(st.get("alerted")),
-                                                  last_alert=float(st.get("last_alert", 0)))
+            for cid, ud in (data.get("users") or {}).items():
+                self.users[cid] = User.from_dict(cid, ud)
+            if "users" not in data and TG_CHAT_IDS:  # формат однопользовательской версии
+                owner = User(TG_CHAT_IDS[0], paused=bool(data.get("paused")))
+                for mid, st in (data.get("pairs") or {}).items():
+                    owner.pairs[int(mid)] = PairState(alerted=bool(st.get("alerted")),
+                                                      last_alert=float(st.get("last_alert", 0)))
+                self.users[owner.chat_id] = owner
             self.tg_offset = int(data.get("tg_offset", 0))
-            self.paused = bool(data.get("paused", False))
             self.known_ids = {int(i) for i in data.get("known_ids", [])}
-            log.info("Состояние восстановлено: %d пар", len(self.states))
+            log.info("Состояние восстановлено: пользователей %d", len(self.users))
             return True
         except Exception as e:  # noqa: BLE001
             log.warning("state.json не прочитан: %s", e)
             return False
 
+    def _migrate_legacy_settings(self) -> None:
+        """Настройки из однопользовательской версии (settings.json) переносим владельцу."""
+        if not SETTINGS_FILE.exists() or not TG_CHAT_IDS:
+            return
+        try:
+            data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            owner = self.users[TG_CHAT_IDS[0]]
+            owner.s = Settings.from_dict({**owner.s.to_dict(), **data})
+            SETTINGS_FILE.rename(SETTINGS_FILE.with_suffix(".migrated.json"))
+            log.info("Старые настройки перенесены владельцу")
+        except Exception as e:  # noqa: BLE001
+            log.warning("Миграция settings.json не удалась: %s", e)
+
     def save_state(self) -> None:
         data = {
-            "pairs": {str(mid): {"alerted": st.alerted, "last_alert": st.last_alert}
-                      for mid, st in self.states.items() if st.alerted or st.last_alert},
+            "users": {cid: u.to_dict() for cid, u in self.users.items()},
             "tg_offset": self.tg_offset,
-            "paused": self.paused,
             "known_ids": sorted(self.markets) or sorted(self.known_ids),
         }
         try:
@@ -437,11 +482,8 @@ class App:
                 log.warning("Telegram %s: %s", method, data)
             return data
 
-    async def send(self, text: str, chat_ids: list[str] | None = None) -> None:
-        targets = chat_ids or TG_CHAT_IDS
-        if not targets:
-            log.info("[нет TG_CHAT_ID] %s", re.sub(r"<[^>]+>", "", text))
-            return
+    @staticmethod
+    def _chunks(text: str) -> list[str]:
         chunks, cur = [], ""
         for block in text.split("\n\n"):
             if len(cur) + len(block) + 2 > 3900:
@@ -450,13 +492,36 @@ class App:
             cur = f"{cur}\n\n{block}" if cur else block
         if cur:
             chunks.append(cur)
+        return chunks
+
+    async def send(self, text: str, chat_ids: list[str] | None = None) -> None:
+        """Отправка. Без chat_ids — владельцу (TG_CHAT_ID)."""
+        targets = chat_ids if chat_ids is not None else TG_CHAT_IDS
+        if not targets:
+            log.info("[нет получателя] %s", re.sub(r"<[^>]+>", "", text))
+            return
         for cid in targets:
-            for ch in chunks:
+            for ch in self._chunks(text):
                 try:
-                    await self.tg("sendMessage", chat_id=cid, text=ch, parse_mode="HTML",
-                                  disable_web_page_preview=True)
+                    data = await self.tg("sendMessage", chat_id=cid, text=ch, parse_mode="HTML",
+                                         disable_web_page_preview=True)
                 except Exception as e:  # noqa: BLE001
                     log.warning("Не удалось отправить в %s: %s", cid, e)
+                    break
+                if data and not data.get("ok"):
+                    if data.get("error_code") == 403 and not is_owner(cid):
+                        # пользователь заблокировал бота — отписываем
+                        self.users.pop(str(cid), None)
+                        log.info("Пользователь %s заблокировал бота — удалён", cid)
+                        break
+                    retry = (data.get("parameters") or {}).get("retry_after")
+                    if retry:
+                        await asyncio.sleep(float(retry))
+            if len(targets) > 1:
+                await asyncio.sleep(0.05)  # лимит Telegram ~30 сообщений/с
+
+    async def broadcast(self, text: str) -> None:
+        await self.send(text, [cid for cid, u in self.users.items() if not u.paused])
 
     # ---------- рынки ----------
     async def fetch_markets(self) -> dict[int, Market]:
@@ -482,12 +547,12 @@ class App:
                     else:  # тихий перезапуск: сообщаем только о листингах, появившихся пока бот не работал
                         fresh = [m for i, m in selected.items() if self.known_ids and i not in self.known_ids]
                         if fresh:
-                            await self.send("🆕 Новые пары в мониторинге: " +
-                                            ", ".join(html.escape(m.label) for m in fresh))
+                            await self.broadcast("🆕 Новые пары в мониторинге: " +
+                                                 ", ".join(html.escape(m.label) for m in fresh))
                 elif added:
-                    await self.send("🆕 Новые пары в мониторинге: " +
-                                    ", ".join(html.escape(m.label) for m in added))
-                log.info("Рынков в мониторинге: %d", len(self.markets))
+                    await self.broadcast("🆕 Новые пары в мониторинге: " +
+                                         ", ".join(html.escape(m.label) for m in added))
+                log.info("Рынков в мониторинге: %d, пользователей: %d", len(self.markets), len(self.users))
             except Exception as e:  # noqa: BLE001
                 log.warning("Не удалось обновить список рынков: %s", e)
                 if first:
@@ -495,19 +560,21 @@ class App:
                     continue
             await asyncio.sleep(MARKETS_REFRESH_SEC)
 
+    def unreachable_note(self, s: Settings) -> str:
+        bad = [m for m in self.markets.values() if min_spread_pct(m, m.last_price) > s.spread]
+        if not bad:
+            return ""
+        return (f"⚠️ У {len(bad)} пар даже спред в 1 тик больше {s.spread:g}% (шаг цены $0.01 при низкой цене), "
+                "с текущим порогом они не пройдут никогда: " +
+                ", ".join(f"{html.escape(m.base)} ({min_spread_pct(m, m.last_price):.4f}%)"
+                          for m in sorted(bad, key=lambda m: m.base)) +
+                "\nЧтобы ловить и их: <code>/set spread 0.005</code>")
+
     def startup_text(self) -> str:
         ms = sorted(self.markets.values(), key=lambda m: m.label)
-        unreachable = [m for m in ms if min_spread_pct(m, m.last_price) > self.s.spread]
-        lines = [f"🚀 <b>Мониторинг Lighter RH запущен</b>\nПар: {len(ms)} — " +
-                 ", ".join(html.escape(m.label) for m in ms),
-                 self.settings_text()]
-        if unreachable:
-            lines.append(
-                f"⚠️ У {len(unreachable)} пар даже спред в 1 тик больше {self.s.spread}% "
-                "(слишком дешёвая цена при шаге цены), по текущему порогу они не пройдут никогда: " +
-                ", ".join(f"{html.escape(m.base)} ({min_spread_pct(m, m.last_price):.4f}%)" for m in unreachable) +
-                "\nЕсли хочешь их тоже ловить — подними порог: <code>/set spread 0.005</code>")
-        return "\n\n".join(lines)
+        parts = [f"🚀 <b>Мониторинг Lighter RH запущен</b>\nПар: {len(ms)} — " +
+                 ", ".join(html.escape(m.label) for m in ms)]
+        return "\n\n".join(parts)
 
     # ---------- WebSocket ----------
     def restart_feeds(self) -> None:
@@ -571,38 +638,49 @@ class App:
             log.warning("WS сообщение об ошибке: %s", msg)
 
     # ---------- оценка и алерты ----------
-    def snapshot(self) -> list[tuple[Market, Metrics | None]]:
-        out = []
-        for mid, m in self.markets.items():
-            book = self.books.get(mid)
-            met = compute_metrics(book, m.tick, self.s.size, self.s.band) if book and book.ready else None
-            out.append((m, met))
+    def metrics_for(self, m: Market, s: Settings, cache: dict | None = None) -> Metrics | None:
+        key = (m.id, s.size, s.band)
+        if cache is not None and key in cache:
+            return cache[key]
+        book = self.books.get(m.id)
+        met = compute_metrics(book, m.tick, s.size, s.band) if book and book.ready else None
+        if cache is not None:
+            cache[key] = met
+        return met
+
+    def evaluate(self, now: float) -> dict[str, tuple[list, list]]:
+        """Возвращает {chat_id: (новые хорошие пары, ушедшие пары)}."""
+        cache: dict = {}
+        out: dict[str, tuple[list, list]] = {}
+        for cid, u in list(self.users.items()):
+            if u.paused:
+                continue
+            s = u.s
+            good_new, lost = [], []
+            for m in self.markets.values():
+                met = self.metrics_for(m, s, cache)
+                st = u.pairs.setdefault(m.id, PairState())
+                if passes(met, s):
+                    st.bad_since = None
+                    if st.ok_since is None:
+                        st.ok_since = now
+                    if (not st.alerted and now - st.ok_since >= s.hold
+                            and now - st.last_alert >= s.cooldown * 60):
+                        st.alerted, st.last_alert = True, now
+                        good_new.append((m, met, now - st.ok_since))
+                else:
+                    st.ok_since = None
+                    if st.alerted:
+                        st.bad_since = st.bad_since or now
+                        if now - st.bad_since >= s.grace:
+                            st.alerted, st.bad_since = False, None
+                            lost.append((m, met))
+            if good_new or lost:
+                out[cid] = (good_new, lost)
         return out
 
-    def evaluate(self, now: float) -> tuple[list, list]:
-        s = self.s
-        good_new, lost = [], []
-        for m, met in self.snapshot():
-            st = self.states.setdefault(m.id, PairState())
-            if passes(met, s):
-                st.bad_since = None
-                if st.ok_since is None:
-                    st.ok_since = now
-                if (not self.paused and not st.alerted and now - st.ok_since >= s.hold
-                        and now - st.last_alert >= s.cooldown * 60):
-                    st.alerted, st.last_alert = True, now
-                    good_new.append((m, met, now - st.ok_since))
-            else:
-                st.ok_since = None
-                if st.alerted:
-                    st.bad_since = st.bad_since or now
-                    if now - st.bad_since >= s.grace:
-                        st.alerted, st.bad_since = False, None
-                        lost.append((m, met))
-        return good_new, lost
-
-    def good_text(self, m: Market, met: Metrics, held: float) -> str:
-        s = self.s
+    @staticmethod
+    def good_text(m: Market, met: Metrics, held: float, s: Settings) -> str:
         return (f"🟢 <b>{html.escape(m.label)}</b> — узкий спред, плотный стакан\n"
                 f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · "
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
@@ -611,15 +689,16 @@ class App:
                 f"Глубина ±{s.band:g}%: bid {fmt_usd(met.depth_bid)} / ask {fmt_usd(met.depth_ask)}\n"
                 f"Держится {held:.0f} с")
 
-    def lost_text(self, m: Market, met: Metrics | None) -> str:
+    @staticmethod
+    def lost_text(m: Market, met: Metrics | None, s: Settings) -> str:
         if met is None:
             return f"🔴 <b>{html.escape(m.label)}</b> — стакан недоступен"
         why = []
-        if met.spread_pct > self.s.spread:
+        if met.spread_pct > s.spread:
             why.append(f"спред {fmt_pct(met.spread_pct)}")
-        if met.impact > self.s.impact:
+        if met.impact > s.impact:
             why.append(f"проскальзывание {fmt_pct(met.impact)}")
-        if met.depth < self.s.depth:
+        if met.depth < s.depth:
             why.append(f"глубина {fmt_usd(met.depth)}")
         return f"🔴 <b>{html.escape(m.label)}</b> — условия ушли: " + ", ".join(why)
 
@@ -627,95 +706,150 @@ class App:
         await asyncio.sleep(5)  # дать стаканам прийти
         while True:
             try:
-                good_new, lost = self.evaluate(time.time())
-                parts = [self.good_text(*g) for g in good_new]
-                if self.s.notify_lost and not self.paused:
-                    parts += [self.lost_text(*l) for l in lost]
-                if parts:
-                    await self.send("\n\n".join(parts))
+                for cid, (good_new, lost) in self.evaluate(time.time()).items():
+                    u = self.users.get(cid)
+                    if not u:
+                        continue
+                    parts = [self.good_text(m, met, held, u.s) for m, met, held in good_new]
+                    if u.s.notify_lost:
+                        parts += [self.lost_text(m, met, u.s) for m, met in lost]
+                    if parts:
+                        await self.send("\n\n".join(parts), [cid])
             except Exception:  # noqa: BLE001
                 log.exception("Ошибка в цикле оценки")
             await asyncio.sleep(EVAL_INTERVAL_SEC)
 
     # ---------- команды ----------
-    def settings_text(self) -> str:
-        s = self.s
-        return ("⚙️ <b>Фильтры</b>\n"
-                f"spread ≤ {s.spread:g}%  ·  impact ≤ {s.impact:g}% на {fmt_usd(s.size)}\n"
-                f"depth ≥ {fmt_usd(s.depth)} на сторону в ±{s.band:g}%\n"
-                f"hold {s.hold:g} с  ·  cooldown {s.cooldown:g} мин  ·  "
-                f"notify_lost {'on' if s.notify_lost else 'off'}"
-                + ("\n⏸ <b>Алерты на паузе</b>" if self.paused else ""))
+    @staticmethod
+    def settings_text(u: User) -> str:
+        s = u.s
+        return ("⚙️ <b>Твои фильтры</b>\n"
+                f"spread ≤ {s.spread:g}%\n"
+                f"impact ≤ {s.impact:g}% на size {fmt_usd(s.size)}\n"
+                f"depth ≥ {fmt_usd(s.depth)} на сторону в band ±{s.band:g}%\n"
+                f"hold {s.hold:g} с · cooldown {s.cooldown:g} мин\n"
+                f"grace {s.grace:g} с · notify_lost {'on' if s.notify_lost else 'off'}"
+                + ("\n\n⏸ <b>Алерты на паузе</b> — /resume" if u.paused else ""))
 
-    def status_text(self, top: int = 15) -> str:
-        rows = [(m, met) for m, met in self.snapshot() if met]
+    def status_text(self, u: User, top: int = 15) -> str:
+        s = u.s
+        rows = [(m, met) for m in self.markets.values() if (met := self.metrics_for(m, s))]
         if not rows:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows.sort(key=lambda r: (r[1].spread_pct, r[1].impact))
         lines = [f"{'Пара':<10}{'Спред%':>8}{'Тик':>4}{'Impact%':>9}{'Глуб.':>8}"]
         for m, met in rows[:top]:
-            mark = "✅" if passes(met, self.s) else "  "
+            mark = "✅" if passes(met, s) else "  "
             imp = "∞" if math.isinf(met.impact) else f"{met.impact:.4f}"
             lines.append(f"{mark}{m.base[:8]:<8}{met.spread_pct:>8.4f}{met.spread_ticks:>4g}"
                          f"{imp:>9}{fmt_usd(met.depth):>8}")
-        ok = sum(1 for _, met in rows if passes(met, self.s))
-        return (f"📊 <b>Топ-{min(top, len(rows))} по спреду</b> (проходят фильтр: {ok}/{len(rows)})\n"
+        ok = sum(1 for _, met in rows if passes(met, s))
+        return (f"📊 <b>Топ-{min(top, len(rows))} по спреду</b> (проходят твои фильтры: {ok}/{len(rows)})\n"
                 f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
-                f"Impact — проскальзывание на {fmt_usd(self.s.size)}, глубина — min из сторон в ±{self.s.band:g}%")
+                f"Impact — проскальзывание на {fmt_usd(s.size)}, глубина — меньшая из сторон в ±{s.band:g}%")
+
+    def welcome_text(self, u: User) -> str:
+        s = u.s
+        return ("👋 <b>Привет!</b> Я слежу за стаканами всех акций и pre-IPO на Lighter (Robinhood Chain) "
+                "и пишу, когда по паре можно зайти почти без потерь на спреде.\n\n"
+                "Каждую секунду проверяю у каждой пары:\n"
+                f"▫️ спред ≤ {s.spread:g}%\n"
+                f"▫️ рыночная заявка на {fmt_usd(s.size)} сдвинет цену не больше чем на {s.impact:g}%\n"
+                f"▫️ в ±{s.band:g}% от цены стоит минимум {fmt_usd(s.depth)} на покупку и на продажу\n\n"
+                f"Если всё держится {s.hold:g} с — пришлю 🟢 с цифрами, когда уйдёт — 🔴.\n\n"
+                "Ты уже подписан ✅ Настрой под себя: /help")
 
     def help_text(self, chat_id) -> str:
-        sets = "\n".join(f"<code>/set {k} …</code> — {v}" for k, v in SETTING_HELP.items())
-        return ("Бот следит за спредом и плотностью стакана по акциям на Lighter (Robinhood Chain).\n\n"
-                "/status — текущий топ пар по спреду\n/settings — текущие фильтры\n"
-                "/pause, /resume — выключить/включить алерты\n/pairs — какие пары в мониторинге\n\n"
-                f"{sets}\n\nТвой chat id: <code>{chat_id}</code>")
+        sets = "\n".join(f"<code>{k}</code> — {v}" for k, v in SETTING_HELP.items())
+        return ("<b>Настройки</b> — командой <code>/set</code>, например:\n"
+                "<code>/set spread 0.005</code>\n<code>/set size 10000</code>\n\n"
+                f"{sets}\n\n"
+                "Можно несколько команд одним сообщением, каждую с новой строки.\n\n"
+                "<b>Команды</b>\n"
+                "/status — топ пар по спреду прямо сейчас\n"
+                "/settings — твои текущие фильтры\n"
+                "/pairs — пары в мониторинге\n"
+                "/pause · /resume — выключить и включить алерты\n"
+                "/reset — вернуть настройки по умолчанию\n"
+                "/help — эта справка")
+
+    def stats_text(self) -> str:
+        active = sum(1 for u in self.users.values() if not u.paused)
+        day = sum(1 for u in self.users.values() if time.time() - u.joined < 86400)
+        return (f"👥 Пользователей: {len(self.users)} (активных {active}, новых за сутки {day})\n"
+                f"Пар в мониторинге: {len(self.markets)}\n"
+                f"Аптайм этого запуска: {(time.time() - self.started) / 3600:.1f} ч")
 
     async def handle_command(self, chat_id: str, text: str) -> None:
+        chat_id = str(chat_id)
         cmd, *args = text.strip().split()
         cmd = cmd.split("@")[0].lower()
-        reply = None
-        if cmd in ("/start", "/help"):
+        u = self.users.get(chat_id)
+        if u is None:
+            if not (ALLOW_PUBLIC or is_owner(chat_id)):
+                await self.send("Это приватный бот.", [chat_id])
+                return
+            if len(self.users) >= MAX_USERS:
+                await self.send("Бот сейчас переполнен, попробуй позже.", [chat_id])
+                return
+            u = self.users[chat_id] = User(chat_id)
+            log.info("Новый пользователь %s (всего %d)", chat_id, len(self.users))
+            await self.send(self.welcome_text(u), [chat_id])
+            if cmd == "/start":
+                return
+        if cmd == "/start":
+            reply = self.welcome_text(u)
+        elif cmd == "/help":
             reply = self.help_text(chat_id)
-        elif str(chat_id) not in TG_CHAT_IDS:
-            reply = f"Нет доступа. Добавь <code>{chat_id}</code> в TG_CHAT_ID в .env и перезапусти бота."
         elif cmd == "/status":
-            reply = self.status_text(int(args[0]) if args and args[0].isdigit() else 15)
+            reply = self.status_text(u, min(int(args[0]), 50) if args and args[0].isdigit() else 15)
         elif cmd == "/settings":
-            reply = self.settings_text()
+            reply = self.settings_text(u)
+            if note := self.unreachable_note(u.s):
+                reply += "\n\n" + note
         elif cmd == "/pairs":
             reply = f"Пар: {len(self.markets)}\n" + ", ".join(
                 html.escape(m.label) for m in sorted(self.markets.values(), key=lambda m: m.label))
         elif cmd == "/pause":
-            self.paused = True
+            u.paused = True
             reply = "⏸ Алерты на паузе. /resume — включить."
         elif cmd == "/resume":
-            self.paused = False
+            u.paused = False
             reply = "▶️ Алерты включены."
+        elif cmd == "/reset":
+            u.s = Settings()
+            u.pairs.clear()
+            reply = "♻️ Настройки сброшены.\n\n" + self.settings_text(u)
         elif cmd == "/set":
-            reply = self.apply_set(args)
+            reply = self.apply_set(u, args)
+        elif cmd == "/stats" and is_owner(chat_id):
+            reply = self.stats_text()
         else:
             reply = "Не знаю такую команду. /help"
-        await self.send(reply, [str(chat_id)])
+        await self.send(reply, [chat_id])
 
-    def apply_set(self, args: list[str]) -> str:
+    def apply_set(self, u: User, args: list[str]) -> str:
         if len(args) != 2 or args[0].lower() not in SETTING_HELP:
-            return "Формат: <code>/set spread 0.005</code>\n" + "\n".join(
-                f"{k} — {v}" for k, v in SETTING_HELP.items())
+            return "Формат: <code>/set spread 0.005</code>\n\n" + "\n".join(
+                f"<code>{k}</code> — {v}" for k, v in SETTING_HELP.items())
         key, raw = args[0].lower(), args[1].replace(",", ".").replace("%", "").replace("$", "")
         try:
             if key == "notify_lost":
-                val = raw.lower() in ("on", "1", "true", "yes", "да")
+                val = raw.lower() in ("on", "1", "true", "yes", "да", "вкл")
             else:
                 val = float(raw)
-                if val < 0:
+                if val < 0 or math.isinf(val) or math.isnan(val):
                     raise ValueError
+                if key == "size" and not 10 <= val <= 10_000_000:
+                    return "size — от $10 до $10M."
+                if key == "band" and val > 5:
+                    return "band — не больше 5%."
         except ValueError:
             return "Не понял значение."
-        setattr(self.s, key, val)
-        self.s.save()
-        for st in self.states.values():  # переоценить с нуля по новым порогам
+        setattr(u.s, key, val)
+        for st in u.pairs.values():  # переоценить с нуля по новым порогам
             st.ok_since = None
-        return "✅ Сохранено.\n\n" + self.settings_text()
+        return f"✅ {key} = {args[1]}\n\n" + self.settings_text(u)
 
     async def tg_loop(self) -> None:
         if not TG_TOKEN:
@@ -723,11 +857,12 @@ class App:
             return
         await self.tg("setMyCommands", commands=[
             {"command": "status", "description": "Топ пар по спреду сейчас"},
-            {"command": "settings", "description": "Текущие фильтры"},
+            {"command": "settings", "description": "Мои фильтры"},
+            {"command": "help", "description": "Как настроить (/set)"},
             {"command": "pairs", "description": "Пары в мониторинге"},
             {"command": "pause", "description": "Выключить алерты"},
             {"command": "resume", "description": "Включить алерты"},
-            {"command": "help", "description": "Помощь и команды /set"},
+            {"command": "reset", "description": "Сбросить настройки"},
         ])
         while True:
             try:
@@ -736,8 +871,10 @@ class App:
                     self.tg_offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
                     text = msg.get("text") or ""
+                    if "chat" not in msg:
+                        continue
                     # можно несколько команд в одном сообщении — каждая с новой строки
-                    for line in text.splitlines():
+                    for line in text.splitlines()[:15]:
                         if line.strip().startswith("/"):
                             await self.handle_command(str(msg["chat"]["id"]), line.strip())
             except asyncio.CancelledError:
@@ -772,7 +909,7 @@ def main() -> None:
     logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
                         format="%(asctime)s %(levelname)s %(message)s")
     if not TG_CHAT_IDS:
-        log.warning("TG_CHAT_ID не задан: напиши боту /start, он пришлёт chat id — впиши его в .env")
+        log.warning("TG_CHAT_ID (владелец) не задан — служебные сообщения будут только в логе")
     try:
         asyncio.run(App().run())
     except KeyboardInterrupt:

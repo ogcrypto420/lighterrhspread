@@ -68,6 +68,7 @@ jobs:
           INCLUDE_SPOT: ${{ vars.INCLUDE_SPOT }}
           SYMBOLS: ${{ vars.SYMBOLS }}
           EXCLUDE: ${{ vars.EXCLUDE }}
+          ALLOW_PUBLIC: ${{ vars.ALLOW_PUBLIC }}
         run: python bot.py
 
       - name: Save state

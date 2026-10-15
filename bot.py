@@ -838,18 +838,16 @@ class App:
         if not rows:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows.sort(key=lambda r: (r[1].spread_pct, r[1].impact))
-        lines = [f"{'Пара':<9}{'Спред%':>7}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
-        for m, met in rows[:top]:
-            mark = "✅" if passes(met, s) else "  "
-            imp = "∞" if math.isinf(met.impact) else f"{met.impact:.3f}"
-            lines.append(f"{mark}{m.symbol[:7]:<7}{met.spread_pct:>7.4f}{met.spread_ticks:>4g}"
-                         f"{imp:>7}{fmt_usd(met.depth):>6}")
         ok = sum(1 for _, met in rows if passes(met, s))
         name = EXCHANGES[ex][0]
-        return (f"📊 <b>{name}: топ-{min(top, len(rows))} по спреду</b> (проходят фильтры: {ok}/{len(rows)})\n"
-                f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
-                f"Impact — проскальзывание на {fmt_usd(s.size)}, %, "
-                f"глубина — меньшая из сторон в ±{s.band:g}%")
+        out = [f"📊 <b>{name}: топ-{min(top, len(rows))} по спреду</b> (проходят фильтры: {ok}/{len(rows)})",
+               "<code>" + html.escape(f"{'Спред%':>8}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}") + "</code>"]
+        for m, met in rows[:top]:
+            out.append(f"<b>{html.escape(m.symbol)}</b>" + (" ✅" if passes(met, s) else ""))
+            out.append("<code>" + html.escape(self._row("", met, 0)) + "</code>")
+        out.append(f"\nImpact — проскальзывание на {fmt_usd(s.size)}, %, "
+                   f"глубина — меньшая из сторон в ±{s.band:g}%")
+        return "\n".join(out)
 
     def status_merged(self, u: User, top: int) -> str:
         """Core включён: по каждой акции блок из строк RH и CORE друг под другом."""
@@ -864,28 +862,28 @@ class App:
         if not by_base:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))
-        lines = [f"{'Пара':<6}{'':5}{'Спред%':>9}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}"]
+        out = [f"📊 <b>Топ-{min(top, len(rows))} акций по спреду, RH и CORE</b>",
+               "<code>" + html.escape(f"{'':5}{'Спред%':>8}{'Тик':>4}{'Impact':>7}{'Глуб.':>6}") + "</code>"]
         ok = 0
-        for i, (base, mets) in enumerate(rows[:top]):
-            if i:
-                lines.append("")
-            first = True
+        for base, mets in rows[:top]:
+            out.append(f"\n<b>{html.escape(base)}</b>")
             for ex, tag in (("rh", "RH"), ("core", "CORE")):
                 met = mets.get(ex)
-                name = base[:6] if first else ""
-                first = False
                 if met is None:
-                    lines.append(f"{name:<6}{tag:<5}{'—':>9}")
+                    out.append("<code>" + html.escape(f"{tag:<5}{'—':>8}") + "</code>")
                     continue
                 good = passes(met, s)
                 ok += good
-                imp = "∞" if math.isinf(met.impact) else f"{met.impact:.3f}"
-                lines.append(f"{name:<6}{tag:<5}{met.spread_pct:>9.4f}{met.spread_ticks:>4g}"
-                             f"{imp:>7}{fmt_usd(met.depth):>6}" + (" ✅" if good else ""))
-        return (f"📊 <b>Топ-{min(top, len(rows))} акций по спреду, RH и CORE</b> (✅ проходят фильтры: {ok})\n"
-                f"<pre>{html.escape(chr(10).join(lines))}</pre>\n"
-                f"Impact — проскальзывание на {fmt_usd(s.size)}, %, глубина — меньшая из сторон в ±{s.band:g}%, "
-                "— — пары нет на CORE.\nТолько одна биржа: /status_rh · /status_core")
+                out.append("<code>" + html.escape(self._row(tag, met, 5)) + "</code>" + (" ✅" if good else ""))
+        out.append(f"\n✅ проходят фильтры: {ok}. Impact — проскальзывание на {fmt_usd(s.size)}, %, "
+                   f"глубина — меньшая из сторон в ±{s.band:g}%, — — пары нет на CORE.\n"
+                   "Только одна биржа: /status_rh · /status_core")
+        return "\n".join(out)
+
+    @staticmethod
+    def _row(tag: str, met: Metrics, w: int) -> str:
+        imp = "∞" if math.isinf(met.impact) else f"{met.impact:.3f}"
+        return f"{tag:<{w}}{met.spread_pct:>8.4f}{met.spread_ticks:>4g}{imp:>7}{fmt_usd(met.depth):>6}"
 
     def welcome_text(self, u: User) -> str:
         s = u.s

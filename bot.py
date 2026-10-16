@@ -817,7 +817,15 @@ class App:
                 if now - w.ok_since < u.s.hold:
                     continue
                 del u.watches[key]
-                out.append((cid, self.watch_text(m, met, w, u.s, now - w.ok_since)))
+                text = self.watch_text(m, met, w, u.s, now - w.ok_since)
+                other = "core" if ex == "rh" else "rh"
+                om = self.find_market(base, other) if other in EXCHANGES else None
+                omet = self.metrics_for(om, u.s) if om else None
+                if omet:
+                    still = " (наблюдение там продолжается)" if f"{other}:{base}" in u.watches else ""
+                    text += (f"\nНа {EXCHANGES[other][0]} сейчас: спред {fmt_pct(omet.spread_pct)} "
+                             f"({omet.spread_ticks:g} тик.){still}")
+                out.append((cid, text))
         return out
 
     @staticmethod
@@ -827,7 +835,7 @@ class App:
                 f"держится {held:.0f} с\n"
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
                 f"Проскальзывание на {fmt_usd(s.size)}: buy {fmt_pct(met.buy_impact)} / sell {fmt_pct(met.sell_impact)}\n"
-                f"Наблюдение снято. Снова: /watch {html.escape(m.base)} {w.spread:g}")
+                f"Наблюдение по {m.ex_name} снято. Снова: /watch {html.escape(m.base)} {m.ex} {w.spread:g}")
 
     def watch_list_text(self, u: User) -> str:
         if not u.watches:
@@ -835,7 +843,8 @@ class App:
                     "<code>/watch NVDA</code> — напишу, когда спред по NVDA станет ≤ твоего spread "
                     f"({u.s.spread:g}%)\n"
                     "<code>/watch NVDA 0.01</code> — свой порог, %\n"
-                    "<code>/watch NVDA core</code> — на основном Lighter")
+                    "По умолчанию слежу сразу на Lighter RH и основном Lighter (Core), "
+                    "только одна биржа: <code>/watch NVDA rh</code> или <code>/watch NVDA core</code>")
         lines = ["🎯 <b>Наблюдения</b>"]
         for key, w in sorted(u.watches.items()):
             ex, base = key.split(":", 1)
@@ -849,7 +858,7 @@ class App:
     def apply_watch(self, u: User, args: list[str]) -> str:
         if not args:
             return self.watch_list_text(u)
-        ticker, ex, spread = None, "rh", u.s.spread
+        ticker, ex, spread = None, "both", u.s.spread
         for a in args:
             low = a.lower().rstrip("%").replace(",", ".")
             if low in ("rh", "core"):
@@ -864,20 +873,26 @@ class App:
             return "Мониторинг основного Lighter сейчас выключен на уровне бота."
         if not 0 < spread <= 5:
             return "Порог спреда — от 0 до 5%, например <code>/watch NVDA 0.01</code>"
-        m = self.find_market(ticker, ex)
-        if m is None:
-            return (f"Не нашёл {html.escape(ticker.upper())} на {EXCHANGES.get(ex, (ex,))[0]} среди пар в мониторинге. "
-                    "Список: /pairs")
-        key = f"{ex}:{m.base}"
-        if key not in u.watches and len(u.watches) >= MAX_WATCHES:
+        exs = ["rh", "core"] if ex == "both" else [ex]
+        found = [(e, m) for e in exs if e in EXCHANGES and (m := self.find_market(ticker, e))]
+        if not found:
+            where = "Lighter RH и основном Lighter" if ex == "both" else EXCHANGES.get(ex, (ex,))[0]
+            return (f"Не нашёл {html.escape(ticker.upper())} на {where} среди пар в мониторинге. Список: /pairs")
+        new = [f"{e}:{m.base}" for e, m in found if f"{e}:{m.base}" not in u.watches]
+        if len(u.watches) + len(new) > MAX_WATCHES:
             return f"Не больше {MAX_WATCHES} наблюдений. Убери лишние: /unwatch"
-        u.watches[key] = Watch(spread)
-        met = self.metrics_for(m, u.s)
-        now_s = f"Сейчас спред {fmt_pct(met.spread_pct)} ({met.spread_ticks:g} тик.)." if met else ""
-        return (f"🎯 Слежу за <b>{html.escape(m.label)}</b>: напишу один раз, когда спред будет ≤ {spread:g}% "
-                f"{u.s.hold:g} с подряд. {now_s}\n"
+        lines = []
+        for e, m in found:
+            u.watches[f"{e}:{m.base}"] = Watch(spread)
+            met = self.metrics_for(m, u.s)
+            now_s = f"сейчас {fmt_pct(met.spread_pct)} ({met.spread_ticks:g} тик.)" if met else "стакан загружается"
+            lines.append(f"▫️ {EXCHANGES[e][0]}: {now_s}")
+        base = found[0][1].base
+        return (f"🎯 Слежу за <b>{html.escape(base)}</b>: напишу, когда спред будет ≤ {spread:g}% "
+                f"{u.s.hold:g} с подряд" + (" — по каждой бирже отдельно" if len(found) > 1 else "") + ".\n"
+                + "\n".join(lines) + "\n"
                 "Работает и на /pause. Все наблюдения: /watch · убрать: "
-                f"/unwatch {html.escape(m.base)}")
+                f"/unwatch {html.escape(base)}")
 
     def apply_unwatch(self, u: User, args: list[str]) -> str:
         if not args or args[0].lower() in ("all", "все"):
@@ -1215,7 +1230,7 @@ class App:
             {"command": "settings", "description": "Мои фильтры"},
             {"command": "help", "description": "Как настроить (/set)"},
             {"command": "pairs", "description": "Пары в мониторинге"},
-            {"command": "watch", "description": "Алерт по тикеру: /watch NVDA 0.01"},
+            {"command": "watch", "description": "Алерт по тикеру на RH и Core: /watch NVDA 0.01"},
             {"command": "unwatch", "description": "Убрать наблюдение по тикеру"},
             {"command": "pause", "description": "Выключить алерты"},
             {"command": "resume", "description": "Включить алерты"},

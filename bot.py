@@ -432,17 +432,30 @@ class PairState:
 
 
 @dataclass
+class Watch:
+    """Наблюдение за одной парой: «напиши, когда спред сузится до N%» (например, чтобы выйти из сделки)."""
+    spread: float
+    created: float = field(default_factory=time.time)
+    ok_since: float | None = None
+
+
+MAX_WATCHES = 20
+
+
+@dataclass
 class User:
     chat_id: str
     s: Settings = field(default_factory=Settings)
     paused: bool = False
     joined: float = field(default_factory=time.time)
     pairs: dict[str, PairState] = field(default_factory=dict)
+    watches: dict[str, Watch] = field(default_factory=dict)     # "rh:NVDA" → Watch
 
     def to_dict(self) -> dict:
         return {"v": 2, "s": self.s.to_dict(), "paused": self.paused, "joined": self.joined,
                 "pairs": {key: {"alerted": st.alerted, "last_alert": st.last_alert}
-                          for key, st in self.pairs.items() if st.alerted or st.last_alert}}
+                          for key, st in self.pairs.items() if st.alerted or st.last_alert},
+                "watches": {k: {"spread": w.spread, "created": w.created} for k, w in self.watches.items()}}
 
     @classmethod
     def from_dict(cls, chat_id: str, d: dict) -> "User":
@@ -454,6 +467,11 @@ class User:
             key = f"rh:{key}" if str(key).isdigit() else str(key)   # старый формат — только RH
             u.pairs[key] = PairState(alerted=bool(st.get("alerted")),
                                      last_alert=float(st.get("last_alert", 0)))
+        for key, w in (d.get("watches") or {}).items():
+            try:
+                u.watches[str(key)] = Watch(float(w["spread"]), float(w.get("created") or time.time()))
+            except (KeyError, TypeError, ValueError):
+                pass
         return u
 
 
@@ -775,6 +793,105 @@ class App:
                 out[cid] = (good_new, lost)
         return out
 
+    def find_market(self, ticker: str, ex: str) -> Market | None:
+        t = ticker.upper().lstrip("$")
+        t = ALIASES.get(t, t)
+        found = [m for m in self.markets.values() if m.ex == ex and (m.base == t or m.symbol == t)]
+        found.sort(key=lambda m: m.mtype != "perp")          # фьючерс важнее спота
+        return found[0] if found else None
+
+    def evaluate_watches(self, now: float) -> list[tuple[str, str]]:
+        """Наблюдения /watch: спред по паре держится ≤ порога hold секунд → одно сообщение, наблюдение снимается.
+        Работают и на паузе: это явная просьба пользователя."""
+        out = []
+        for cid, u in list(self.users.items()):
+            for key, w in list(u.watches.items()):
+                ex, base = key.split(":", 1)
+                m = self.find_market(base, ex)
+                met = self.metrics_for(m, u.s) if m else None
+                if met is None or met.spread_pct > w.spread + 1e-12:
+                    w.ok_since = None
+                    continue
+                if w.ok_since is None:
+                    w.ok_since = now
+                if now - w.ok_since < u.s.hold:
+                    continue
+                del u.watches[key]
+                out.append((cid, self.watch_text(m, met, w, u.s, now - w.ok_since)))
+        return out
+
+    @staticmethod
+    def watch_text(m: Market, met: Metrics, w: Watch, s: Settings, held: float) -> str:
+        return (f"🎯 <b>{html.escape(m.label)}</b> — спред сузился, можно выходить\n"
+                f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · порог {w.spread:g}% · "
+                f"держится {held:.0f} с\n"
+                f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
+                f"Проскальзывание на {fmt_usd(s.size)}: buy {fmt_pct(met.buy_impact)} / sell {fmt_pct(met.sell_impact)}\n"
+                f"Наблюдение снято. Снова: /watch {html.escape(m.base)} {w.spread:g}")
+
+    def watch_list_text(self, u: User) -> str:
+        if not u.watches:
+            return ("🎯 Наблюдений нет.\n\n"
+                    "<code>/watch NVDA</code> — напишу, когда спред по NVDA станет ≤ твоего spread "
+                    f"({u.s.spread:g}%)\n"
+                    "<code>/watch NVDA 0.01</code> — свой порог, %\n"
+                    "<code>/watch NVDA core</code> — на основном Lighter")
+        lines = ["🎯 <b>Наблюдения</b>"]
+        for key, w in sorted(u.watches.items()):
+            ex, base = key.split(":", 1)
+            m = self.find_market(base, ex)
+            met = self.metrics_for(m, u.s) if m else None
+            now_s = f"сейчас {fmt_pct(met.spread_pct)}" if met else "стакан недоступен"
+            lines.append(f"{html.escape(base)} · {EXCHANGES.get(ex, (ex,))[0]}: ждём ≤ {w.spread:g}% ({now_s})")
+        lines.append("\nУбрать: /unwatch NVDA · /unwatch all")
+        return "\n".join(lines)
+
+    def apply_watch(self, u: User, args: list[str]) -> str:
+        if not args:
+            return self.watch_list_text(u)
+        ticker, ex, spread = None, "rh", u.s.spread
+        for a in args:
+            low = a.lower().rstrip("%").replace(",", ".")
+            if low in ("rh", "core"):
+                ex = low
+            elif re.fullmatch(r"\d+(\.\d+)?|\.\d+", low):
+                spread = float(low)
+            else:
+                ticker = a
+        if not ticker:
+            return "Укажи тикер: <code>/watch NVDA</code>"
+        if ex == "core" and "core" not in EXCHANGES:
+            return "Мониторинг основного Lighter сейчас выключен на уровне бота."
+        if not 0 < spread <= 5:
+            return "Порог спреда — от 0 до 5%, например <code>/watch NVDA 0.01</code>"
+        m = self.find_market(ticker, ex)
+        if m is None:
+            return (f"Не нашёл {html.escape(ticker.upper())} на {EXCHANGES.get(ex, (ex,))[0]} среди пар в мониторинге. "
+                    "Список: /pairs")
+        key = f"{ex}:{m.base}"
+        if key not in u.watches and len(u.watches) >= MAX_WATCHES:
+            return f"Не больше {MAX_WATCHES} наблюдений. Убери лишние: /unwatch"
+        u.watches[key] = Watch(spread)
+        met = self.metrics_for(m, u.s)
+        now_s = f"Сейчас спред {fmt_pct(met.spread_pct)} ({met.spread_ticks:g} тик.)." if met else ""
+        return (f"🎯 Слежу за <b>{html.escape(m.label)}</b>: напишу один раз, когда спред будет ≤ {spread:g}% "
+                f"{u.s.hold:g} с подряд. {now_s}\n"
+                "Работает и на /pause. Все наблюдения: /watch · убрать: "
+                f"/unwatch {html.escape(m.base)}")
+
+    def apply_unwatch(self, u: User, args: list[str]) -> str:
+        if not args or args[0].lower() in ("all", "все"):
+            n = len(u.watches)
+            u.watches.clear()
+            return f"🎯 Наблюдения сняты ({n})." if n else "🎯 Наблюдений и так нет."
+        t = args[0].upper().lstrip("$")
+        t = ALIASES.get(t, t)
+        exs = [a.lower() for a in args[1:] if a.lower() in ("rh", "core")] or ["rh", "core"]
+        gone = [k for k in list(u.watches) if k.split(":", 1)[1] == t and k.split(":", 1)[0] in exs]
+        for k in gone:
+            del u.watches[k]
+        return f"🎯 Снял наблюдение за {html.escape(t)}." if gone else f"За {html.escape(t)} наблюдения нет. /watch — список"
+
     def twin_line(self, m: Market, s: Settings, cache: dict | None = None) -> str:
         """Та же акция на другой бирже — для сравнения в алерте (если у пользователя включён Core)."""
         if s.venue != "both":
@@ -831,6 +948,8 @@ class App:
                         parts += [self.lost_text(m, met, u.s) for m, met in lost]
                     if parts:
                         await self.send("\n\n".join(parts), [cid])
+                for cid, text in self.evaluate_watches(time.time()):
+                    await self.send(text, [cid])
             except Exception:  # noqa: BLE001
                 log.exception("Ошибка в цикле оценки")
             await asyncio.sleep(EVAL_INTERVAL_SEC)
@@ -970,6 +1089,8 @@ class App:
                 "/status — топ пар по спреду прямо сейчас\n"
                 "/settings — твои текущие фильтры\n"
                 "/pairs — пары в мониторинге\n"
+                "/watch NVDA — напишу, когда спред по паре сузится (например, чтобы выйти из сделки); "
+                "<code>/watch NVDA 0.01</code> — свой порог, /watch — список, /unwatch NVDA — убрать\n"
                 "/pause · /resume — выключить и включить алерты\n"
                 "/core — добавить или убрать сравнение с основным Lighter (Core)\n"
                 "/reset — вернуть настройки по умолчанию\n"
@@ -1052,6 +1173,10 @@ class App:
             reply = "♻️ Настройки сброшены.\n\n" + self.settings_text(u)
         elif cmd == "/set":
             reply = self.apply_set(u, args)
+        elif cmd == "/watch":
+            reply = self.apply_watch(u, args)
+        elif cmd == "/unwatch":
+            reply = self.apply_unwatch(u, args)
         elif cmd == "/stats" and is_owner(chat_id):
             reply = self.stats_text()
         else:
@@ -1090,6 +1215,8 @@ class App:
             {"command": "settings", "description": "Мои фильтры"},
             {"command": "help", "description": "Как настроить (/set)"},
             {"command": "pairs", "description": "Пары в мониторинге"},
+            {"command": "watch", "description": "Алерт по тикеру: /watch NVDA 0.01"},
+            {"command": "unwatch", "description": "Убрать наблюдение по тикеру"},
             {"command": "pause", "description": "Выключить алерты"},
             {"command": "resume", "description": "Включить алерты"},
             {"command": "core", "description": "Сравнение с основным Lighter вкл/выкл"},

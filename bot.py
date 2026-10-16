@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import threading
 import time
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
@@ -1097,6 +1098,7 @@ class App:
         while True:
             try:
                 data = await self.tg("getUpdates", offset=self.tg_offset, timeout=30, allowed_updates=["message"])
+                self.tg_alive = time.time()
                 for upd in (data or {}).get("result", []):
                     self.tg_offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
@@ -1118,7 +1120,29 @@ class App:
             await asyncio.sleep(30)
             self.save_state()
 
+    WATCHDOG_SEC = 240
+
+    def start_watchdog(self) -> None:
+        """Если бот перестал опрашивать Telegram (завис), завершаем процесс:
+        GitHub Actions сохранит настройки и сразу запустит следующую копию."""
+        self.tg_alive = time.time()
+
+        def watch():
+            while True:
+                time.sleep(20)
+                stale = time.time() - self.tg_alive
+                if stale > self.WATCHDOG_SEC:
+                    log.error("Бот не опрашивал Telegram %.0f с — завис, перезапускаюсь", stale)
+                    try:
+                        self.save_state()
+                    except Exception:  # noqa: BLE001
+                        log.exception("Не удалось сохранить состояние перед перезапуском")
+                    os._exit(3)
+        if TG_TOKEN:
+            threading.Thread(target=watch, name="watchdog", daemon=True).start()
+
     async def run(self) -> None:
+        self.start_watchdog()
         async with aiohttp.ClientSession() as self.http:
             loops = asyncio.gather(self.markets_loop(), self.eval_loop(), self.tg_loop(), self.autosave_loop())
             try:

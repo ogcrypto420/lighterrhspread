@@ -437,6 +437,9 @@ class Watch:
     spread: float
     created: float = field(default_factory=time.time)
     ok_since: float | None = None
+    bad_since: float | None = None
+    alerted: bool = False          # уже написали; снова — когда спред уйдёт выше порога и вернётся
+    last_alert: float = 0.0
 
 
 MAX_WATCHES = 20
@@ -455,7 +458,8 @@ class User:
         return {"v": 2, "s": self.s.to_dict(), "paused": self.paused, "joined": self.joined,
                 "pairs": {key: {"alerted": st.alerted, "last_alert": st.last_alert}
                           for key, st in self.pairs.items() if st.alerted or st.last_alert},
-                "watches": {k: {"spread": w.spread, "created": w.created} for k, w in self.watches.items()}}
+                "watches": {k: {"spread": w.spread, "created": w.created, "alerted": w.alerted,
+                                "last_alert": w.last_alert} for k, w in self.watches.items()}}
 
     @classmethod
     def from_dict(cls, chat_id: str, d: dict) -> "User":
@@ -469,7 +473,9 @@ class User:
                                      last_alert=float(st.get("last_alert", 0)))
         for key, w in (d.get("watches") or {}).items():
             try:
-                u.watches[str(key)] = Watch(float(w["spread"]), float(w.get("created") or time.time()))
+                u.watches[str(key)] = Watch(float(w["spread"]), float(w.get("created") or time.time()),
+                                            alerted=bool(w.get("alerted")),
+                                            last_alert=float(w.get("last_alert") or 0))
             except (KeyError, TypeError, ValueError):
                 pass
         return u
@@ -801,8 +807,9 @@ class App:
         return found[0] if found else None
 
     def evaluate_watches(self, now: float) -> list[tuple[str, str]]:
-        """Наблюдения /watch: спред по паре держится ≤ порога hold секунд → одно сообщение, наблюдение снимается.
-        Работают и на паузе: это явная просьба пользователя."""
+        """Наблюдения /watch: спред по паре держится ≤ порога hold секунд → сообщение.
+        Наблюдение снимает только сам пользователь (/unwatch). Повторно пишем, когда спред уйдёт выше порога
+        (на grace секунд) и снова сузится, но не чаще cooldown. Работают и на паузе."""
         out = []
         for cid, u in list(self.users.items()):
             for key, w in list(u.watches.items()):
@@ -811,31 +818,29 @@ class App:
                 met = self.metrics_for(m, u.s) if m else None
                 if met is None or met.spread_pct > w.spread + 1e-12:
                     w.ok_since = None
+                    if w.alerted and met is not None:
+                        w.bad_since = w.bad_since or now
+                        if now - w.bad_since >= u.s.grace:
+                            w.alerted, w.bad_since = False, None
                     continue
+                w.bad_since = None
                 if w.ok_since is None:
                     w.ok_since = now
-                if now - w.ok_since < u.s.hold:
+                if (w.alerted or now - w.ok_since < u.s.hold
+                        or now - w.last_alert < u.s.cooldown * 60):
                     continue
-                del u.watches[key]
-                text = self.watch_text(m, met, w, u.s, now - w.ok_since)
-                other = "core" if ex == "rh" else "rh"
-                om = self.find_market(base, other) if other in EXCHANGES else None
-                omet = self.metrics_for(om, u.s) if om else None
-                if omet:
-                    still = " (наблюдение там продолжается)" if f"{other}:{base}" in u.watches else ""
-                    text += (f"\nНа {EXCHANGES[other][0]} сейчас: спред {fmt_pct(omet.spread_pct)} "
-                             f"({omet.spread_ticks:g} тик.){still}")
-                out.append((cid, text))
+                w.alerted, w.last_alert = True, now
+                out.append((cid, self.watch_text(m, met, w, u.s, now - w.ok_since)))
         return out
 
     @staticmethod
     def watch_text(m: Market, met: Metrics, w: Watch, s: Settings, held: float) -> str:
-        return (f"🎯 <b>{html.escape(m.label)}</b> — спред сузился, можно выходить\n"
+        return (f"🎯 <b>{html.escape(m.label)}</b> — спред сузился, можно выходить\n\n"
                 f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · порог {w.spread:g}% · "
                 f"держится {held:.0f} с\n"
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
-                f"Проскальзывание на {fmt_usd(s.size)}: buy {fmt_pct(met.buy_impact)} / sell {fmt_pct(met.sell_impact)}\n"
-                f"Наблюдение по {m.ex_name} снято. Снова: /watch {html.escape(m.base)} {m.ex} {w.spread:g}")
+                f"Проскальзывание на {fmt_usd(s.size)}: buy {fmt_pct(met.buy_impact)} / sell {fmt_pct(met.sell_impact)}\n\n"
+                f"Наблюдение активно. Снять: /unwatch {html.escape(m.base)}")
 
     def watch_list_text(self, u: User) -> str:
         if not u.watches:
@@ -890,9 +895,10 @@ class App:
         base = found[0][1].base
         return (f"🎯 Слежу за <b>{html.escape(base)}</b>: напишу, когда спред будет ≤ {spread:g}% "
                 f"{u.s.hold:g} с подряд" + (" — по каждой бирже отдельно" if len(found) > 1 else "") + ".\n"
-                + "\n".join(lines) + "\n"
-                "Работает и на /pause. Все наблюдения: /watch · убрать: "
-                f"/unwatch {html.escape(base)}")
+                + "\n".join(lines) + "\n\n"
+                "Наблюдение не снимается само: повторю, когда спред расширится и снова сузится "
+                f"(не чаще раза в {u.s.cooldown:g} мин). Работает и на /pause.\n"
+                f"Снять: /unwatch {html.escape(base)} · все наблюдения: /watch")
 
     def apply_unwatch(self, u: User, args: list[str]) -> str:
         if not args or args[0].lower() in ("all", "все"):
@@ -929,7 +935,7 @@ class App:
         both = twin.endswith("✅")
         head = (f"🟢🟢 <b>{html.escape(m.symbol)} · RH + CORE</b> — узкий спред на обеих биржах"
                 if both else f"🟢 <b>{html.escape(m.label)}</b> — узкий спред, плотный стакан")
-        return (f"{head}\n"
+        return (f"{head}\n\n"
                 f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · "
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
                 f"Проскальзывание на {fmt_usd(s.size)}: buy {fmt_pct(met.buy_impact)} / "

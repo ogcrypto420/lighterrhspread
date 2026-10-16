@@ -835,7 +835,7 @@ class App:
 
     @staticmethod
     def watch_text(m: Market, met: Metrics, w: Watch, s: Settings, held: float) -> str:
-        return (f"🎯 <b>{html.escape(m.label)}</b> — спред сузился, можно выходить\n\n"
+        return (f"🎯 <b>{html.escape(m.label)}</b> — спред сузился\n\n"
                 f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · порог {w.spread:g}% · "
                 f"держится {held:.0f} с\n"
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"

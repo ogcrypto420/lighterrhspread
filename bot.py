@@ -1091,7 +1091,7 @@ class App:
         caption = (f"📈 <b>{t}</b>: спред за {per}{note}\n\n"
                    f"Посмотреть за час или за несколько дней:\n"
                    f"<code>/history {t} 1h</code>\n"
-                   f"<code>/history {t} 7d</code>")
+                   f"<code>/history {t} 3d</code>")
         plain = caption + "\n\n" + "\n\n".join(text)
         if status_image and all(series):
             png = status_image.render_history(

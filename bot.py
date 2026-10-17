@@ -294,11 +294,6 @@ def norm_ticker(t: str) -> str:
     return ENTROPY_ALIASES.get(t, ALIASES.get(t, t))
 
 
-def s_extras_or_entropy(s: "Settings") -> list[str]:
-    """Для /history: биржи сравнения пользователя; если ничего не включено — Entropy (если пара там есть)."""
-    return s.extras() or ["entropy"]
-
-
 def join_names(names: list[str]) -> str:
     return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " и " + names[-1]
 
@@ -1053,7 +1048,9 @@ class App:
         if not ticker:
             return "Укажи тикер: <code>/history NVDA</code>"
         base = norm_ticker(ticker)
-        exs = [only] if only else ["rh"] + [e for e in s_extras_or_entropy(u.s) if e in EXCHANGES]
+        # RH + Entropy всегда (если пара там есть), Core — если включён /core
+        exs = [only] if only else ["rh"] + [e for e in u.s.extras() + ["entropy"] if e in EXCHANGES and e != "rh"]
+        exs = list(dict.fromkeys(exs))
         now = time.time()
         series, text = [], []
         for ex in exs:

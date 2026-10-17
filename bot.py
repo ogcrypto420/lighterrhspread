@@ -113,9 +113,9 @@ EVAL_INTERVAL_SEC = env_float("EVAL_INTERVAL_SEC", 1.0)
 DATA_DIR = Path(env_str("DATA_DIR", str(HERE)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = DATA_DIR / "settings.json"
-STATE_FILE = DATA_DIR / "state.json"
+STATE_FILE = DATA_DIR / "state.json"   # чтобы после перезапуска не дублировать алерты
 HISTORY_FILE = DATA_DIR / "history.json"   # история спреда для /history
-HISTORY_SAMPLE_SEC = env_float("HISTORY_SAMPLE_SEC", 1)   # чтобы после перезапуска не дублировать алерты
+HISTORY_SAMPLE_SEC = env_float("HISTORY_SAMPLE_SEC", 1)   # как часто снимать спред, с
 # Через сколько минут бот сам корректно завершится (0 — работать бесконечно).
 # Нужно для GitHub Actions, где один запуск живёт максимум 6 часов.
 MAX_RUNTIME_MIN = env_float("MAX_RUNTIME_MIN", 0)

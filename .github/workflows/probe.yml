@@ -1,0 +1,37 @@
+name: probe entropy
+on: push
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install aiohttp
+      - run: |
+          cat > p.py <<'PY'
+          import asyncio, json, aiohttp
+          def note(t):
+              for i in range(0, len(t), 3500):
+                  print("::notice::" + t[i:i+3500].replace("\n", " | "))
+          async def main():
+              async with aiohttp.ClientSession() as s:
+                  async def info(body):
+                      async with s.post("https://api.hyperliquid.xyz/info", json=body) as r:
+                          return await r.json(content_type=None)
+                  dexs = await info({"type": "perpDexs"})
+                  note("DEXS " + json.dumps([d and d.get("name") for d in dexs]))
+                  m = await info({"type": "metaAndAssetCtxs", "dex": "io"})
+                  u = m[0]["universe"]
+                  note("IO " + json.dumps([[x["name"], x["szDecimals"], x.get("isDelisted"), x.get("growthMode"), m[1][i].get("midPx")] for i, x in enumerate(u)]))
+                  async with s.get("https://api.rh.lighter.xyz/api/v1/orderBookDetails") as r:
+                      d = await r.json(content_type=None)
+                  note("RH " + json.dumps(sorted(x["symbol"] for x in d.get("order_book_details", []) if x.get("status") == "active")))
+                  coin = u[0]["name"]
+                  async with s.ws_connect("wss://api.hyperliquid.xyz/ws") as ws:
+                      await ws.send_json({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}})
+                      for _ in range(3):
+                          msg = await ws.receive_json(timeout=15)
+                          note("WS " + json.dumps(msg)[:1500])
+          asyncio.run(main())
+          PY
+          python p.py

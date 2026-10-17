@@ -1,6 +1,6 @@
 """История спреда: бот сам записывает спред каждой пары (Lighter не хранит историю стакана).
 
-Каждую секунду берётся снимок спреда, снимки складываются в 5-минутные корзины:
+Каждую секунду берётся снимок спреда, снимки складываются в минутные корзины (старше суток — в 30-минутные):
 [начало, число снимков, мин %, сумма %, макс %, сумма mid, шаг цены, [число снимков со спредом 1, 2 … 10, >10 тиков]].
 По тикам потом точно считается, сколько времени спред был не шире порога пользователя.
 Хранится KEEP_DAYS дней, файл сохраняется между перезапусками вместе с остальным состоянием.
@@ -12,7 +12,7 @@ import math
 import time
 from pathlib import Path
 
-BUCKET = 300
+BUCKET = 60            # последние сутки — по минуте
 COARSE = 1800          # старше суток — корзины по 30 минут, чтобы файл не разрастался
 KEEP_DAYS = 7
 MAX_TICKS = 10
@@ -77,10 +77,8 @@ class History:
 
     def save(self) -> None:
         self.prune()
-        out = {k: [[b[0], b[1], round(b[2], 6), round(b[3], 5), round(b[4], 6), round(b[5], 4), b[6], b[7]]
-                   + ([COARSE] if width(b) == COARSE else []) for b in v] for k, v in self.data.items()}
         tmp = self.path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"since": self.since, "data": out}, separators=(",", ":")), encoding="utf-8")
+        tmp.write_text(json.dumps({"since": self.since, "data": self.data}, separators=(",", ":")), encoding="utf-8")
         tmp.replace(self.path)
 
     # ---------- чтение ----------
@@ -103,8 +101,17 @@ def _merge(a: list, b: list) -> None:
     a[7] = [x + y for x, y in zip(a[7], b[7])]
 
 
-def points(buckets: list[list]) -> list[tuple[float, float, float, float]]:
-    """(время середины корзины, средний, мин, макс спред %)"""
+def points(buckets: list[list], step: int = 0) -> list[tuple[float, float, float, float]]:
+    """(время середины, средний, мин, макс спред %). step > 0 — укрупнить до step секунд (для длинных периодов)."""
+    if step:
+        merged: list[list] = []
+        for b in buckets:
+            start = int(b[0] // step * step)
+            if merged and merged[-1][0] == start:
+                _merge(merged[-1], b)
+            else:
+                merged.append([start, b[1], b[2], b[3], b[4], b[5], b[6], list(b[7]), step])
+        buckets = merged
     return [(b[0] + width(b) / 2, b[3] / b[1], b[2], b[4]) for b in buckets]
 
 

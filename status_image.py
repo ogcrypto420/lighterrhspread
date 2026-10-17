@@ -243,7 +243,7 @@ def render_history(title: str, subtitle: str, series: list[Series], *, threshold
         col = TAG_COLORS.get(x_.tag, TAG_CORE)
         pts = sorted(x_.points)
         diffs = sorted(b[0] - a[0] for a, b in zip(pts, pts[1:])) or [300]
-        gap = max(601, 2.5 * diffs[len(diffs) // 2], 1801 * 1.5 if span > 86400 * 1.1 else 0)
+        gap = max(181, 2.5 * diffs[len(diffs) // 2])
         seg: list[tuple] = []
         segments = []
         for p in pts:
@@ -255,7 +255,8 @@ def render_history(title: str, subtitle: str, series: list[Series], *, threshold
             segments.append(seg)
         for sg in segments:
             if len(sg) >= 2:
-                d.line([(X(p[0]), Y(p[1])) for p in sg], fill=col, width=s * 2, joint="curve")
+                d.line([(X(p[0]), Y(p[1])) for p in sg], fill=col, width=s if len(pts) > 500 else s * 2,
+                       joint="curve")
             else:
                 p = sg[0]
                 d.ellipse([X(p[0]) - 3 * s, Y(p[1]) - 3 * s, X(p[0]) + 3 * s, Y(p[1]) + 3 * s], fill=col)
@@ -281,8 +282,9 @@ def render_history(title: str, subtitle: str, series: list[Series], *, threshold
             d.text((PAD * s, y * s), ln, font=f_line, fill=TEXT)
             y += 24
         y += 8
-    d.text((PAD * s, (H - 34) * s), "Линия — средний спред за 5 минут" +
-           (" (старше суток — за 30 минут)" if span > 86400 * 1.1 else ""), font=f_axis, fill=MUTED)
+    d.text((PAD * s, (H - 34) * s), "Линия — средний спред " +
+           ("за каждую минуту" if span <= 86400 * 1.1 else "за 5 минут" if span <= 2 * 86400 * 1.05
+            else "за 30 минут"), font=f_axis, fill=MUTED)
 
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)

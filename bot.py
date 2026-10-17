@@ -1064,7 +1064,8 @@ class App:
             lines = [f"Средний {st['avg']:.4f}% · мин {st['min']:.4f}% · макс {st['max']:.4f}% · медиана {mt} тик.",
                      f"Не шире твоего порога {u.s.spread:g}%: {st['below']:.0f}% времени",
                      f"Самые узкие часы (МСК): {best}"]
-            series.append(status_image.Series(name, H.points(bks), lines) if status_image else None)
+            step = 0 if period <= 86400 else H.COARSE if period > 2 * 86400 else 300
+            series.append(status_image.Series(name, H.points(bks, step), lines) if status_image else None)
             text.append(f"<b>{name}</b>\n" + "\n".join(lines))
         if not text:
             m_any = any(self.find_market(base, e) for e in EXCHANGES)
@@ -1510,7 +1511,7 @@ class App:
             await asyncio.sleep(30)
             self.save_state()
             n += 1
-            if n % 10 == 0:          # историю — раз в 5 минут
+            if n % 20 == 0:          # историю — раз в 10 минут (и при каждом завершении)
                 self.save_history()
 
     def save_history(self) -> None:

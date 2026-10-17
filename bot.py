@@ -1257,7 +1257,7 @@ class App:
                 "<code>/watch NVDA 0.01</code> — свой порог, /watch — список, /unwatch NVDA — убрать\n"
                 "/pause · /resume — выключить и включить алерты\n"
                 "/core — добавить или убрать сравнение с основным Lighter (Core)\n"
-                "/entropy — добавить или убрать сравнение с Entropy (Hyperliquid)\n"
+                "/entropy — добавить или убрать сравнение с Entropy (.io)\n"
                 "/reset — вернуть настройки по умолчанию\n"
                 "/help — эта справка")
 
@@ -1345,7 +1345,7 @@ class App:
                     st.ok_since = None
                 common = sorted({m.base for m in self.markets.values() if m.ex == "entropy"})
                 reply = (("➕ Сравнение RH ↔ Entropy включено (Core убран). Алерты по-прежнему по Lighter RH; "
-                          "если акция есть на Entropy (Hyperliquid), в алерте видна она же там, а если пара хороша "
+                          "если акция есть на Entropy (.io), в алерте видна она же там, а если пара хороша "
                           "на обеих биржах — придёт 🟢🟢. В /status — только общие пары RH и Entropy.\n"
                           f"Общие с RH пары: {', '.join(common) or 'пока нет'}.\n"
                           "На Entropy есть комиссия тейкера — она видна в строке сравнения. /entropy — убрать.")
@@ -1403,7 +1403,7 @@ class App:
             {"command": "pause", "description": "Выключить алерты"},
             {"command": "resume", "description": "Включить алерты"},
             {"command": "core", "description": "Сравнение с основным Lighter вкл/выкл"},
-            {"command": "entropy", "description": "Сравнение с Entropy (Hyperliquid) вкл/выкл"},
+            {"command": "entropy", "description": "Сравнение с Entropy (.io) вкл/выкл"},
             {"command": "reset", "description": "Сбросить настройки"},
         ])
         while True:

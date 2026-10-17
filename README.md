@@ -91,7 +91,7 @@ WantedBy=multi-user.target
 - `/set spread 0.005` · `/set size 10000` · `/set impact 0.01` · `/set depth 50000` · `/set band 0.05` · `/set hold 10` · `/set cooldown 30` · `/set notify_lost off`
 - `/pause`, `/resume` — выключить/включить алерты
 - `/core` — добавить/убрать основной Lighter (Core)
-- `/entropy` — добавить/убрать Entropy (Hyperliquid); `/status_entropy` — только эта биржа
+- `/entropy` — добавить/убрать Entropy (.io); `/status_entropy` — только эта биржа
 - `/reset` — вернуть настройки по умолчанию
 - `/stats` — число пользователей (только владелец)
 - `/pairs` — какие пары в мониторинге

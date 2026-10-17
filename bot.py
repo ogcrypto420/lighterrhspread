@@ -85,6 +85,18 @@ CORE_WS_URL = env_str("CORE_WS_URL", "wss://mainnet.zklighter.elliot.ai/stream?r
 EXCHANGES: dict[str, tuple[str, str, str]] = {"rh": ("RH", API_URL, WS_URL)}
 if ENABLE_CORE:
     EXCHANGES["core"] = ("CORE", CORE_API_URL, CORE_WS_URL)
+# Entropy — биржа HIP-3 на Hyperliquid (префикс тикеров «io:»); стаканы — публичный API Hyperliquid
+ENABLE_ENTROPY = env_bool("ENABLE_ENTROPY", True)
+HL_INFO_URL = env_str("HL_INFO_URL", "https://api.hyperliquid.xyz/info")
+HL_WS_URL = env_str("HL_WS_URL", "wss://api.hyperliquid.xyz/ws")
+ENTROPY_DEX = env_str("ENTROPY_DEX", "io")
+if ENABLE_ENTROPY:
+    EXCHANGES["entropy"] = ("ENTROPY", HL_INFO_URL, HL_WS_URL)
+COMPARE_EXCHANGES = [e for e in ("core", "entropy") if e in EXCHANGES]   # с чем сравниваем RH
+# Тикеры Entropy → как на RH
+ENTROPY_ALIASES = {"OAI": "OPENAI", "ANTH": "ANTHROPIC"}
+# Тейкер-комиссия HIP-3 (база Hyperliquid 0.045% × 2); в growth mode — 10% от неё
+HL_TAKER_FEE_PCT = env_float("HL_TAKER_FEE_PCT", 0.09)
 
 INCLUDE_ETF = env_bool("INCLUDE_ETF", False)              # SPY, QQQ, SOXL, USO, SLV, SGOV
 INCLUDE_PREIPO = env_bool("INCLUDE_PREIPO", True)        # OPENAI, ANTHROPIC, SHEIN …
@@ -140,9 +152,15 @@ class Settings:
     grace: float = env_float("LOST_GRACE_SECONDS", 10)      # через сколько сек плохого стакана пара «ушла»
     notify_lost: bool = env_bool("NOTIFY_LOST", True)       # слать ли «пара ушла»
     venue: str = env_str("VENUE", "rh").lower()             # rh — только Robinhood, both — RH + Core (/core)
+    entropy: bool = env_bool("SHOW_ENTROPY", False)         # сравнение с Entropy (/entropy)
+
+    def extras(self) -> list[str]:
+        """С какими биржами пользователь сравнивает RH."""
+        on = {"core": self.venue == "both", "entropy": self.entropy}
+        return [e for e in COMPARE_EXCHANGES if on.get(e)]
 
     def wants(self, m: "Market") -> bool:
-        return self.venue in ("both", m.ex)
+        return m.ex == "rh" or m.ex in self.extras()
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -186,7 +204,9 @@ class Market:
     mtype: str           # perp / spot
     price_decimals: int
     last_price: float
-    ex: str = "rh"       # rh / core
+    ex: str = "rh"       # rh / core / entropy
+    coin: str = ""       # Entropy: имя монеты на Hyperliquid («io:OAI»)
+    taker_fee: float = 0.0   # тейкер-комиссия, %
 
     @property
     def key(self) -> str:
@@ -263,6 +283,46 @@ def parse_markets(data: dict, ex: str = "rh") -> dict[str, Market]:
                     int(m.get("price_decimals", 2)), float(m.get("last_trade_price") or 0), ex)
         spots[mk.key] = mk
     return {**perps, **spots}
+
+
+def norm_ticker(t: str) -> str:
+    t = t.upper().lstrip("$").split(":")[-1]
+    return ENTROPY_ALIASES.get(t, ALIASES.get(t, t))
+
+
+def join_names(names: list[str]) -> str:
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " и " + names[-1]
+
+
+def hl_price_decimals(px: float, sz_decimals: int) -> int:
+    """Шаг цены Hyperliquid: не больше 5 значащих цифр и не больше 6 − szDecimals знаков после запятой."""
+    if px <= 0:
+        return max(0, 6 - sz_decimals)
+    int_digits = len(str(int(px))) if px >= 1 else 0
+    if px < 1:
+        lead = -int(math.floor(math.log10(px)))        # 0.0123 → 2
+        sig = 5 + lead - 1
+    else:
+        sig = 5 - int_digits
+    return max(0, min(6 - sz_decimals, sig))
+
+
+def parse_entropy(data) -> dict[str, Market]:
+    meta, ctxs = data[0], data[1]
+    out = {}
+    for i, a in enumerate(meta.get("universe") or []):
+        if a.get("isDelisted"):
+            continue
+        coin = a["name"]
+        sym = coin.split(":", 1)[-1].upper()
+        base = ENTROPY_ALIASES.get(sym, ALIASES.get(sym, sym))
+        ctx = ctxs[i] if i < len(ctxs) else {}
+        px = float(ctx.get("midPx") or ctx.get("markPx") or 0)
+        fee = HL_TAKER_FEE_PCT * (0.1 if a.get("growthMode") == "enabled" else 1)
+        mk = Market(i, sym, base, "stock", "perp", hl_price_decimals(px, int(a.get("szDecimals", 0))), px,
+                    "entropy", coin=coin, taker_fee=fee)
+        out[mk.key] = mk
+    return out
 
 
 def select_markets(all_markets: dict[str, Market]) -> dict[str, Market]:
@@ -624,6 +684,12 @@ class App:
         errors = 0
         for ex, (_, api, _) in EXCHANGES.items():
             try:
+                if ex == "entropy":
+                    async with self.http.post(api, json={"type": "metaAndAssetCtxs", "dex": ENTROPY_DEX},
+                                              timeout=aiohttp.ClientTimeout(total=30)) as r:
+                        r.raise_for_status()
+                        out.update(parse_entropy(await r.json(content_type=None)))
+                    continue
                 async with self.http.get(f"{api}/api/v1/orderBookDetails",
                                          timeout=aiohttp.ClientTimeout(total=30)) as r:
                     r.raise_for_status()
@@ -634,7 +700,7 @@ class App:
                 out.update({k: m for k, m in self.markets.items() if m.ex == ex})
         if errors == len(EXCHANGES):
             raise RuntimeError("ни одна биржа не ответила")
-        # на Core оставляем только те акции, что есть на RH — Core нужен лишь для сравнения
+        # на Core и Entropy оставляем только те акции, что есть на RH — они нужны лишь для сравнения
         rh = {(m.base, m.mtype) for m in out.values() if m.ex == "rh"}
         if rh:
             out = {k: m for k, m in out.items() if m.ex == "rh" or (m.base, m.mtype) in rh}
@@ -698,6 +764,11 @@ class App:
             t.cancel()
         self.feeds = []
         for ex in EXCHANGES:
+            if ex == "entropy":
+                coins = {m.key: m.coin for m in self.markets.values() if m.ex == "entropy"}
+                if coins:
+                    self.feeds.append(asyncio.create_task(self.hl_feed(coins), name="feed-entropy"))
+                continue
             ids = sorted(m.id for m in self.markets.values() if m.ex == ex)
             for i in range(0, len(ids), MARKETS_PER_WS):
                 chunk = ids[i:i + MARKETS_PER_WS]
@@ -733,6 +804,59 @@ class App:
                     self.books[f"{ex}:{mid}"].reset()
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
+
+    async def hl_feed(self, coins: dict[str, str]) -> None:
+        """Стаканы Entropy с Hyperliquid: подписка l2Book, каждое сообщение — полный снимок (20 уровней)."""
+        by_coin = {c: k for k, c in coins.items()}
+        backoff = 1
+        while True:
+            try:
+                async with self.http.ws_connect(HL_WS_URL, heartbeat=None, max_msg_size=0) as ws:
+                    for key, coin in coins.items():
+                        self.books[key] = Book()
+                        await ws.send_json({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}})
+                    log.info("WS entropy подключён, подписка на %d рынков", len(coins))
+                    backoff = 1
+                    pinger = asyncio.create_task(self._hl_ping(ws))
+                    try:
+                        async for msg in ws:
+                            if msg.type == aiohttp.WSMsgType.TEXT:
+                                d = json.loads(msg.data)
+                                if d.get("channel") == "l2Book":
+                                    self.on_hl_book(by_coin, d.get("data") or {})
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                                break
+                    finally:
+                        pinger.cancel()
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("WS entropy ошибка: %s", e)
+            for key in coins:
+                if key in self.books:
+                    self.books[key].reset()
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+    def on_hl_book(self, by_coin: dict[str, str], data: dict) -> None:
+        key = by_coin.get(data.get("coin"))
+        levels = data.get("levels") or []
+        if key is None or len(levels) != 2:
+            return
+        book = self.books.setdefault(key, Book())
+        try:
+            book.bids = {float(x["px"]): float(x["sz"]) for x in levels[0]}
+            book.asks = {float(x["px"]): float(x["sz"]) for x in levels[1]}
+        except (KeyError, TypeError, ValueError):
+            return
+        book.nonce = max(book.nonce, 0) + 1
+        book.updated = time.time()
+
+    @staticmethod
+    async def _hl_ping(ws) -> None:
+        while True:
+            await asyncio.sleep(30)  # Hyperliquid закрывает соединение после минуты тишины
+            await ws.send_json({"method": "ping"})
 
     @staticmethod
     async def _ping(ws) -> None:
@@ -800,8 +924,7 @@ class App:
         return out
 
     def find_market(self, ticker: str, ex: str) -> Market | None:
-        t = ticker.upper().lstrip("$")
-        t = ALIASES.get(t, t)
+        t = norm_ticker(ticker)
         found = [m for m in self.markets.values() if m.ex == ex and (m.base == t or m.symbol == t)]
         found.sort(key=lambda m: m.mtype != "perp")          # фьючерс важнее спота
         return found[0] if found else None
@@ -848,8 +971,8 @@ class App:
                     "<code>/watch NVDA</code> — напишу, когда спред по NVDA станет ≤ твоего spread "
                     f"({u.s.spread:g}%)\n"
                     "<code>/watch NVDA 0.01</code> — свой порог, %\n"
-                    "По умолчанию слежу сразу на Lighter RH и основном Lighter (Core), "
-                    "только одна биржа: <code>/watch NVDA rh</code> или <code>/watch NVDA core</code>")
+                    "По умолчанию слежу сразу на всех биржах, где есть пара (RH, Core, Entropy), "
+                    "только одна: <code>/watch NVDA rh</code> · <code>core</code> · <code>entropy</code>")
         lines = ["🎯 <b>Наблюдения</b>"]
         for key, w in sorted(u.watches.items()):
             ex, base = key.split(":", 1)
@@ -866,7 +989,7 @@ class App:
         ticker, ex, spread = None, "both", u.s.spread
         for a in args:
             low = a.lower().rstrip("%").replace(",", ".")
-            if low in ("rh", "core"):
+            if low in ("rh", "core", "entropy"):
                 ex = low
             elif re.fullmatch(r"\d+(\.\d+)?|\.\d+", low):
                 spread = float(low)
@@ -874,14 +997,14 @@ class App:
                 ticker = a
         if not ticker:
             return "Укажи тикер: <code>/watch NVDA</code>"
-        if ex == "core" and "core" not in EXCHANGES:
-            return "Мониторинг основного Lighter сейчас выключен на уровне бота."
+        if ex in ("core", "entropy") and ex not in EXCHANGES:
+            return f"Мониторинг {EXCHANGES.get(ex, (ex.upper(),))[0]} сейчас выключен на уровне бота."
         if not 0 < spread <= 5:
             return "Порог спреда — от 0 до 5%, например <code>/watch NVDA 0.01</code>"
-        exs = ["rh", "core"] if ex == "both" else [ex]
+        exs = ["rh"] + COMPARE_EXCHANGES if ex == "both" else [ex]
         found = [(e, m) for e in exs if e in EXCHANGES and (m := self.find_market(ticker, e))]
         if not found:
-            where = "Lighter RH и основном Lighter" if ex == "both" else EXCHANGES.get(ex, (ex,))[0]
+            where = ", ".join(EXCHANGES[e][0] for e in exs if e in EXCHANGES)
             return (f"Не нашёл {html.escape(ticker.upper())} на {where} среди пар в мониторинге. Список: /pairs")
         new = [f"{e}:{m.base}" for e, m in found if f"{e}:{m.base}" not in u.watches]
         if len(u.watches) + len(new) > MAX_WATCHES:
@@ -905,36 +1028,44 @@ class App:
             n = len(u.watches)
             u.watches.clear()
             return f"🎯 Наблюдения сняты ({n})." if n else "🎯 Наблюдений и так нет."
-        t = args[0].upper().lstrip("$")
-        t = ALIASES.get(t, t)
-        exs = [a.lower() for a in args[1:] if a.lower() in ("rh", "core")] or ["rh", "core"]
+        t = norm_ticker(args[0])
+        exs = [a.lower() for a in args[1:] if a.lower() in EXCHANGES] or list(EXCHANGES)
         gone = [k for k in list(u.watches) if k.split(":", 1)[1] == t and k.split(":", 1)[0] in exs]
         for k in gone:
             del u.watches[k]
         return f"🎯 Снял наблюдение за {html.escape(t)}." if gone else f"За {html.escape(t)} наблюдения нет. /watch — список"
 
+    def twin_lines(self, m: Market, s: Settings, cache: dict | None = None) -> list[tuple[str, str, bool]]:
+        """Та же акция на других биржах (Core, Entropy — что включил пользователь): [(биржа, строка, проходит)]."""
+        out = []
+        base_met = self.metrics_for(m, s, cache)
+        for ex in s.extras():
+            o = next((o for o in self.markets.values()
+                      if o.ex == ex and o.base == m.base and o.mtype == m.mtype), None)
+            if o is None:
+                continue
+            om = self.metrics_for(o, s, cache)
+            if om is None:
+                out.append((o.ex_name, f"На {o.ex_name}: стакан недоступен", False))
+                continue
+            ok = passes(om, s)
+            diff = (om.mid / base_met.mid - 1) * 100 if base_met else 0
+            where = "выше" if diff > 0 else "ниже"
+            price = f"цена там на {abs(diff):.3f}% {where}" if abs(diff) >= 0.0005 else "цена та же"
+            fee = f", комиссия {o.taker_fee:g}%" if o.taker_fee else ""
+            out.append((o.ex_name, f"На {o.ex_name}: спред {fmt_pct(om.spread_pct)} ({om.spread_ticks:g} тик.), "
+                                   f"impact {fmt_pct(om.impact)}{fee}, {price}" + (" ✅" if ok else ""), ok))
+        return out
+
     def twin_line(self, m: Market, s: Settings, cache: dict | None = None) -> str:
-        """Та же акция на другой бирже — для сравнения в алерте (если у пользователя включён Core)."""
-        if s.venue != "both":
-            return ""
-        for o in self.markets.values():
-            if o.ex != m.ex and o.base == m.base and o.mtype == m.mtype:
-                om = self.metrics_for(o, s, cache)
-                if om is None:
-                    return f"На {o.ex_name}: стакан недоступен"
-                ok = " ✅" if passes(om, s) else ""
-                diff = (om.mid / self.metrics_for(m, s, cache).mid - 1) * 100 if self.metrics_for(m, s, cache) else 0
-                where = "выше" if diff > 0 else "ниже"
-                price = f"цена там на {abs(diff):.3f}% {where}" if abs(diff) >= 0.0005 else "цена та же"
-                return (f"На {o.ex_name}: спред {fmt_pct(om.spread_pct)} ({om.spread_ticks:g} тик.), "
-                        f"impact {fmt_pct(om.impact)}, {price}{ok}")
-        return ""
+        return "\n".join(t for _, t, _ in self.twin_lines(m, s, cache))
 
     @staticmethod
     def good_text(m: Market, met: Metrics, held: float, s: Settings, twin: str = "") -> str:
-        both = twin.endswith("✅")
-        head = (f"🟢🟢 <b>{html.escape(m.symbol)} · RH + CORE</b> — узкий спред на обеих биржах"
-                if both else f"🟢 <b>{html.escape(m.label)}</b> — узкий спред, плотный стакан")
+        good = [ln.split(":", 1)[0].removeprefix("На ") for ln in twin.splitlines() if ln.endswith("✅")]
+        head = (f"🟢🟢 <b>{html.escape(m.symbol)} · RH + {' + '.join(good)}</b> — узкий спред на "
+                + ("обеих биржах" if len(good) == 1 else "всех биржах")
+                if good else f"🟢 <b>{html.escape(m.label)}</b> — узкий спред, плотный стакан")
         return (f"{head}\n\n"
                 f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · "
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
@@ -985,14 +1116,15 @@ class App:
                 f"depth ≥ {fmt_usd(s.depth)} на сторону в band ±{s.band:g}%\n"
                 f"hold {s.hold:g} с · cooldown {s.cooldown:g} мин\n"
                 f"grace {s.grace:g} с · notify_lost {'on' if s.notify_lost else 'off'}\n"
-                f"биржи: {'RH + CORE' if s.venue == 'both' else 'только RH'} (/core — переключить)"
+                "биржи: RH" + "".join(" + " + EXCHANGES[e][0] for e in s.extras())
+                + " (/core, /entropy — добавить или убрать)"
                 + ("\n\n⏸ <b>Алерты на паузе</b> — /resume" if u.paused else ""))
 
     def status_text(self, u: User, top: int = 15, only: str | None = None) -> str:
         """only=None: при включённом Core — сводная таблица RH|CORE в одну строку на акцию;
         only='rh'/'core' — подробная таблица по одной бирже."""
         s = u.s
-        if only is None and s.venue == "both" and "core" in EXCHANGES:
+        if only is None and s.extras():
             return self.status_merged(u, top)
         ex = only or "rh"
         rows = [(m, met) for m in self.markets.values() if m.ex == ex and (met := self.metrics_for(m, s))]
@@ -1016,24 +1148,28 @@ class App:
             return None
         s = u.s
         top = min(top, 25)
-        merged = only is None and s.venue == "both" and "core" in EXCHANGES
+        merged = only is None and bool(s.extras())
+        exs = ["rh"] + s.extras()
         groups = []
         if merged:
             by_base: dict[str, dict[str, Metrics]] = {}
             for m in self.markets.values():
-                if m.mtype == "perp" and (met := self.metrics_for(m, s)):
+                if m.mtype == "perp" and m.ex in exs and (met := self.metrics_for(m, s)):
                     by_base.setdefault(m.base, {})[m.ex] = met
+            by_base = {b: v for b, v in by_base.items() if "rh" in v}
             rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))[:top]
             for base, mets in rows:
                 cells = []
-                for ex, tag in (("rh", "RH"), ("core", "CORE")):
+                for ex in exs:
+                    tag = EXCHANGES[ex][0]
                     met = mets.get(ex)
                     cells.append(status_image.Cell(tag, None, None, None, None) if met is None else
                                  status_image.Cell(tag, met.spread_pct, met.spread_ticks, met.impact,
                                                    met.depth, passes(met, s)))
                 groups.append(status_image.Group(base, cells))
-            title = f"Топ-{len(groups)} акций по спреду · RH и CORE"
-            caption = "📊 Подробно по одной бирже: /status_rh · /status_core · текстом: /status_text"
+            title = f"Топ-{len(groups)} акций по спреду · " + join_names([EXCHANGES[e][0] for e in exs])
+            caption = ("📊 Подробно по одной бирже: " + " · ".join(f"/status_{e}" for e in exs)
+                       + " · текстом: /status_text")
         else:
             ex = only or "rh"
             rows = sorted(((m, met) for m in self.markets.values()
@@ -1054,9 +1190,10 @@ class App:
     def status_merged(self, u: User, top: int) -> str:
         """Core включён: по каждой акции блок из строк RH и CORE друг под другом."""
         s = u.s
+        exs = ["rh"] + s.extras()
         by_base: dict[str, dict[str, Metrics]] = {}
         for m in self.markets.values():
-            if m.mtype != "perp":
+            if m.mtype != "perp" or m.ex not in exs:
                 continue
             met = self.metrics_for(m, s)
             if met:
@@ -1064,22 +1201,25 @@ class App:
         if not by_base:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))
-        out = [f"📊 <b>Топ-{min(top, len(rows))} акций по спреду, RH и CORE</b>",
-               "<code>" + html.escape(f"{'':5}{'Спред%':>8}{'Тик':>4}{'Проск.':>7}{'Глуб.':>6}") + "</code>"]
+        names = [EXCHANGES[e][0] for e in exs]
+        w = max(len(n) for n in names) + 1
+        out = [f"📊 <b>Топ-{min(top, len(rows))} акций по спреду, {join_names(names)}</b>",
+               "<code>" + html.escape(f"{'':{w}}{'Спред%':>8}{'Тик':>4}{'Проск.':>7}{'Глуб.':>6}") + "</code>"]
         ok = 0
         for base, mets in rows[:top]:
             out.append(f"\n<b>{html.escape(base)}</b>")
-            for ex, tag in (("rh", "RH"), ("core", "CORE")):
+            for ex in exs:
+                tag = EXCHANGES[ex][0]
                 met = mets.get(ex)
                 if met is None:
-                    out.append("<code>" + html.escape(f"{tag:<5}{'—':>8}") + "</code>")
+                    out.append("<code>" + html.escape(f"{tag:<{w}}{'—':>8}") + "</code>")
                     continue
                 good = passes(met, s)
                 ok += good
-                out.append("<code>" + html.escape(self._row(tag, met, 5)) + "</code>" + (" ✅" if good else ""))
+                out.append("<code>" + html.escape(self._row(tag, met, w)) + "</code>" + (" ✅" if good else ""))
         out.append(f"\n✅ проходят фильтры: {ok}. Проск. — проскальзывание на {fmt_usd(s.size)}, %, "
-                   f"глубина — меньшая из сторон в ±{s.band:g}%, — — пары нет на CORE.\n"
-                   "Только одна биржа: /status_rh · /status_core")
+                   f"глубина — меньшая из сторон в ±{s.band:g}%, — — пары нет на этой бирже.\n"
+                   "Только одна биржа: " + " · ".join(f"/status_{e}" for e in exs))
         return "\n".join(out)
 
     @staticmethod
@@ -1114,6 +1254,7 @@ class App:
                 "<code>/watch NVDA 0.01</code> — свой порог, /watch — список, /unwatch NVDA — убрать\n"
                 "/pause · /resume — выключить и включить алерты\n"
                 "/core — добавить или убрать сравнение с основным Lighter (Core)\n"
+                "/entropy — добавить или убрать сравнение с Entropy (Hyperliquid)\n"
                 "/reset — вернуть настройки по умолчанию\n"
                 "/help — эта справка")
 
@@ -1145,15 +1286,15 @@ class App:
             reply = self.welcome_text(u)
         elif cmd == "/help":
             reply = self.help_text(chat_id)
-        elif cmd in ("/status", "/status_rh", "/status_core", "/status_text"):
-            only = {"/status_rh": "rh", "/status_core": "core"}.get(cmd)
+        elif cmd in ("/status", "/status_rh", "/status_core", "/status_entropy", "/status_text"):
+            only = {"/status_rh": "rh", "/status_core": "core", "/status_entropy": "entropy"}.get(cmd)
             as_text = cmd == "/status_text"
             for a in args:
-                if a.lower() in ("rh", "core"):
+                if a.lower() in ("rh", "core", "entropy"):
                     only = a.lower()
                 if a.lower() in ("text", "текст"):
                     as_text = True
-            if only == "core" and "core" not in EXCHANGES:
+            if only and only not in EXCHANGES:
                 only = "rh"
             num = next((int(a) for a in args if a.isdigit()), 15)
             if not as_text:
@@ -1188,6 +1329,20 @@ class App:
                          "В /status — обе биржи. /core — убрать."
                          if u.s.venue == "both" else
                          "➖ Core убран: снова только Lighter RH. /core — вернуть.")
+        elif cmd == "/entropy":
+            if "entropy" not in EXCHANGES:
+                reply = "Мониторинг Entropy сейчас выключен на уровне бота."
+            else:
+                u.s.entropy = not u.s.entropy
+                for st in u.pairs.values():
+                    st.ok_since = None
+                common = sorted({m.base for m in self.markets.values() if m.ex == "entropy"})
+                reply = (("➕ Entropy добавлен. Алерты по-прежнему по Lighter RH, но в каждом видна та же акция "
+                          "на Entropy (Hyperliquid), а если пара хороша и там — придёт 🟢🟢. "
+                          "В /status — эта биржа тоже, /status_entropy — только она.\n"
+                          f"Общие с RH пары: {', '.join(common) or 'пока нет'}.\n"
+                          "На Entropy есть комиссия тейкера — она видна в строке сравнения. /entropy — убрать.")
+                         if u.s.entropy else "➖ Entropy убран. /entropy — вернуть.")
         elif cmd == "/reset":
             u.s = Settings()
             u.pairs.clear()
@@ -1241,6 +1396,7 @@ class App:
             {"command": "pause", "description": "Выключить алерты"},
             {"command": "resume", "description": "Включить алерты"},
             {"command": "core", "description": "Сравнение с основным Lighter вкл/выкл"},
+            {"command": "entropy", "description": "Сравнение с Entropy (Hyperliquid) вкл/выкл"},
             {"command": "reset", "description": "Сбросить настройки"},
         ])
         while True:

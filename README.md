@@ -2,6 +2,8 @@
 
 Бот следит сразу за двумя биржами: Lighter RH (Robinhood Chain) и основным Lighter (Core). Алерты приходят только по RH. Командой `/core` пользователь добавляет (или убирает) сравнение с основным Lighter: в алерте видна та же акция на CORE, а если пара в норме на обеих биржах — заголовок 🟢🟢 RH + CORE; в /status — обе биржи. Core отключается переменной `ENABLE_CORE=false`.
 
+Так же командой `/entropy` добавляется сравнение с **Entropy** — биржей HIP-3 на Hyperliquid (тикеры `io:…`, стаканы через публичный API Hyperliquid, без ключей). Сравниваются только акции, которые есть и на RH (сейчас OPENAI ↔ OAI, ANTHROPIC ↔ ANTH, SNDK). В строке Entropy видна тейкер-комиссия: на Lighter она нулевая, на HIP-3 — 0.09% (0.009% в growth mode). Отключается переменной `ENABLE_ENTROPY=false`.
+
 Бот публичный: любой, кто нажмёт /start, подписывается на алерты, и у каждого свои настройки `/set`.
 Владелец (chat id в `TG_CHAT_ID`) дополнительно получает служебные сообщения и команду `/stats`.
 Сделать бота приватным: `ALLOW_PUBLIC=false`.
@@ -89,6 +91,7 @@ WantedBy=multi-user.target
 - `/set spread 0.005` · `/set size 10000` · `/set impact 0.01` · `/set depth 50000` · `/set band 0.05` · `/set hold 10` · `/set cooldown 30` · `/set notify_lost off`
 - `/pause`, `/resume` — выключить/включить алерты
 - `/core` — добавить/убрать основной Lighter (Core)
+- `/entropy` — добавить/убрать Entropy (Hyperliquid); `/status_entropy` — только эта биржа
 - `/reset` — вернуть настройки по умолчанию
 - `/stats` — число пользователей (только владелец)
 - `/pairs` — какие пары в мониторинге

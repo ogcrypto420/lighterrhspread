@@ -283,8 +283,8 @@ def render_history(title: str, subtitle: str, series: list[Series], *, threshold
             y += 24
         y += 8
     d.text((PAD * s, (H - 34) * s), "Линия — средний спред " +
-           ("за каждую минуту" if span <= 86400 * 1.1 else "за 5 минут" if span <= 2 * 86400 * 1.05
-            else "за 30 минут"), font=f_axis, fill=MUTED)
+           ("за каждую минуту" if span <= 6 * 3600 * 1.05 else "за 5 минут" if span <= 86400 * 1.05
+            else "за 15 минут" if span <= 2 * 86400 * 1.05 else "за 30 минут"), font=f_axis, fill=MUTED)
 
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)

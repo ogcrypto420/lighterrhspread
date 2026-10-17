@@ -1064,7 +1064,7 @@ class App:
             lines = [f"Средний {st['avg']:.4f}% · мин {st['min']:.4f}% · макс {st['max']:.4f}% · медиана {mt} тик.",
                      f"Не шире твоего порога {u.s.spread:g}%: {st['below']:.0f}% времени",
                      f"Самые узкие часы (МСК): {best}"]
-            step = 0 if period <= 86400 else H.COARSE if period > 2 * 86400 else 300
+            step = 0 if period <= 6 * 3600 else 300 if period <= 86400 else 900 if period <= 2 * 86400 else H.COARSE
             series.append(status_image.Series(name, H.points(bks, step), lines) if status_image else None)
             text.append(f"<b>{name}</b>\n" + "\n".join(lines))
         if not text:

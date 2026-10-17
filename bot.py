@@ -1089,8 +1089,9 @@ class App:
         note = "" if got >= period * 0.9 else f" (данные есть за {got / 3600:.1f} ч — история копится)"
         t = html.escape(base)
         caption = (f"📈 <b>{t}</b>: спред за {per}{note}\n\n"
-                   f"Посмотреть за час или за несколько дней: <code>/history {t} 1h</code> · "
-                   f"<code>/history {t} 6h</code> · <code>/history {t} 3d</code> · <code>/history {t} 7d</code>")
+                   f"Посмотреть за час или за несколько дней:\n"
+                   f"<code>/history {t} 1h</code>\n"
+                   f"<code>/history {t} 7d</code>")
         plain = caption + "\n\n" + "\n\n".join(text)
         if status_image and all(series):
             png = status_image.render_history(

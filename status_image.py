@@ -65,8 +65,17 @@ def _usd(x: float) -> str:
     return f"${x:.0f}"
 
 
+def _u(x: float, bps: bool, nd: int) -> str:
+    """Спред/проскальзывание: в процентах или в базисных пунктах (1 bps = 0.01%)."""
+    return f"{x * 100:.{max(nd - 2, 1)}f}" if bps else f"{x:.{nd}f}"
+
+
+def _thr(x: float, bps: bool) -> str:
+    return f"{x * 100:g} bps" if bps else f"{x:g}%"
+
+
 def render_status(title: str, groups: list[Group], *, spread: float, impact: float, depth: float,
-                  size: float, band: float) -> bytes:
+                  size: float, band: float, bps: bool = False) -> bytes:
     s = SCALE
     f_title = _font("Inter-Bold.otf", 26)
     f_sub = _font("Inter-Regular.otf", 15)
@@ -99,8 +108,9 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
         "depth": (790, "r"),
         "ok": (W - PAD - 40, "c"),
     }
-    heads = {"ticker": "Тикер", "tag": "Биржа", "spread": "Спред, %", "ticks": "Тики",
-             "impact": "Проскальзывание, %", "depth": "Глубина", "ok": "Фильтр"}
+    unit = "bps" if bps else "%"
+    heads = {"ticker": "Тикер", "tag": "Биржа", "spread": f"Спред, {unit}", "ticks": "Тики",
+             "impact": f"Проскальзывание, {unit}", "depth": "Глубина", "ok": "Фильтр"}
 
     def put(col: str, y: int, txt: str, font, fill):
         x, al = cols[col]
@@ -140,10 +150,10 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
             if c.spread is None:
                 put("spread", ty, "—", f_num, MUTED)
                 continue
-            put("spread", ty, f"{c.spread:.4f}", f_num, GREEN if c.spread <= spread + 1e-12 else RED)
+            put("spread", ty, _u(c.spread, bps, 4), f_num, GREEN if c.spread <= spread + 1e-12 else RED)
             put("ticks", ty, f"{c.ticks:g}", f_num, MUTED)
             imp_ok = c.impact is not None and c.impact <= impact + 1e-12
-            put("impact", ty, "∞" if c.impact is None or math.isinf(c.impact) else f"{c.impact:.3f}",
+            put("impact", ty, "∞" if c.impact is None or math.isinf(c.impact) else _u(c.impact, bps, 3),
                 f_num, GREEN if imp_ok else RED)
             put("depth", ty, _usd(c.depth), f_num, GREEN if (c.depth or 0) >= depth else RED)
             if c.ok:  # галочка
@@ -157,7 +167,7 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
             d.line([((PAD + 12) * s, (y - 3) * s), ((W - PAD - 12) * s, (y - 3) * s)], fill=LINE, width=s)
 
     # подвал с фильтрами
-    foot = (f"Фильтры: спред ≤ {spread:g}%  ·  проскальзывание ≤ {impact:g}% на {_usd(size)}  ·  "
+    foot = (f"Фильтры: спред ≤ {_thr(spread, bps)}  ·  проскальзывание ≤ {_thr(impact, bps)} на {_usd(size)}  ·  "
             f"глубина ≥ {_usd(depth)} в ±{band:g}%")
     d.text((PAD * s, (H - foot_h + 26) * s), foot, font=f_sub, fill=MUTED)
     d.text((PAD * s, (H - foot_h + 48) * s), "зелёный — проходит фильтр, красный — нет", font=f_sub, fill=MUTED)
@@ -185,7 +195,10 @@ def _blend(c, bg, a):
 
 
 def render_history(title: str, subtitle: str, series: list[Series], *, threshold: float,
-                   t0: float, t1: float) -> bytes:
+                   t0: float, t1: float, bps: bool = False) -> bytes:
+    if bps:                                   # всё в базисных пунктах: значения × 100
+        series = [Series(x.tag, [(t, a * 100, b * 100, c * 100) for t, a, b, c in x.points], x.lines) for x in series]
+        threshold *= 100
     s = SCALE
     f_title = _font("Inter-Bold.otf", 26)
     f_sub = _font("Inter-Regular.otf", 15)
@@ -221,13 +234,15 @@ def render_history(title: str, subtitle: str, series: list[Series], *, threshold
         v = ymax * i / 4
         y = Y(v)
         d.line([(left * s, y), (right * s, y)], fill=LINE, width=s)
-        lab = f"{v:.3f}" if ymax < 0.1 else f"{v:.2f}"
+        lab = (f"{v:.2f}" if ymax < 10 else f"{v:.1f}") if bps else (f"{v:.3f}" if ymax < 0.1 else f"{v:.2f}")
         d.text(((left - 8) * s - d.textlength(lab, font=f_axis), y - 9 * s), lab, font=f_axis, fill=MUTED)
     # ось X: подписи по МСК
     span = t1 - t0
     step = 3600 * (3 if span <= 26 * 3600 else 24 if span <= 8 * 86400 else 48)
     if span <= 7 * 3600:
         step = 3600
+    if span <= 2.5 * 3600:
+        step = 900
     t = (int(t0 + MSK) // step + 1) * step - MSK
     while t < t1:
         x = X(t)
@@ -267,7 +282,7 @@ def render_history(title: str, subtitle: str, series: list[Series], *, threshold
     while x < right * s:
         d.line([(x, yt), (min(x + 8 * s, right * s), yt)], fill=GREEN, width=s * 2)
         x += 14 * s
-    lab = f"порог {threshold:g}%"
+    lab = f"порог {threshold:g} bps" if bps else f"порог {threshold:g}%"
     d.text(((left + 6) * s, yt - 20 * s), lab, font=f_axis, fill=GREEN)
 
     # статистика под графиком

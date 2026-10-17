@@ -16,6 +16,7 @@ Lighter RH (Robinhood Chain) — алерты о узком спреде и пл
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import html
 import json
 import logging
@@ -155,6 +156,7 @@ class Settings:
     cooldown: float = env_float("COOLDOWN_MIN", 15)         # пауза между алертами по одной паре, мин
     grace: float = env_float("LOST_GRACE_SECONDS", 10)      # через сколько сек плохого стакана пара «ушла»
     notify_lost: bool = env_bool("NOTIFY_LOST", True)       # слать ли «пара ушла»
+    units: str = "pct"                                      # pct — проценты, bps — базисные пункты (/bps)
     venue: str = env_str("VENUE", "rh").lower()             # rh — только Robinhood, both — RH + Core (/core)
     entropy: bool = env_bool("SHOW_ENTROPY", False)         # сравнение с Entropy (/entropy)
 
@@ -473,8 +475,24 @@ def fmt_usd(x: float) -> str:
     return f"${x:.0f}"
 
 
+# в каких единицах показывать спред текущему пользователю: "pct" — проценты, "bps" — базисные пункты
+UNITS: contextvars.ContextVar[str] = contextvars.ContextVar("units", default="pct")
+
+
+def bps_mode() -> bool:
+    return UNITS.get() == "bps"
+
+
 def fmt_pct(x: float, nd: int = 4) -> str:
-    return "нет ликв." if math.isinf(x) else f"{x:.{nd}f}%"
+    """Спред / проскальзывание / разница цен: в % или в bps (1 bps = 0.01%) — как выбрал пользователь."""
+    if math.isinf(x):
+        return "нет ликв."
+    return f"{x * 100:.{max(nd - 2, 1)}f} bps" if bps_mode() else f"{x:.{nd}f}%"
+
+
+def fmt_thr(x: float) -> str:
+    """Порог (spread, impact, порог /watch)."""
+    return f"{x * 100:g} bps" if bps_mode() else f"{x:g}%"
 
 
 def fmt_price(x: float, m: Market) -> str:
@@ -745,11 +763,11 @@ class App:
         bad = [m for m in self.markets.values() if s.wants(m) and min_spread_pct(m, m.last_price) > s.spread]
         if not bad:
             return ""
-        return (f"⚠️ У {len(bad)} пар даже спред в 1 тик больше {s.spread:g}% (шаг цены $0.01 при низкой цене), "
+        return (f"⚠️ У {len(bad)} пар даже спред в 1 тик больше {fmt_thr(s.spread)} (шаг цены $0.01 при низкой цене), "
                 "с текущим порогом они не пройдут никогда: " +
-                ", ".join(f"{html.escape(m.base)}·{m.ex_name} ({min_spread_pct(m, m.last_price):.4f}%)"
+                ", ".join(f"{html.escape(m.base)}·{m.ex_name} ({fmt_pct(min_spread_pct(m, m.last_price))})"
                           for m in sorted(bad, key=lambda m: m.base)) +
-                "\nЧтобы ловить и их: <code>/set spread 0.005</code>")
+                f"\nЧтобы ловить и их: <code>/set spread {'0.5' if bps_mode() else '0.005'}</code>")
 
     def startup_text(self) -> str:
         ms = sorted(self.markets.values(), key=lambda m: m.label)
@@ -958,13 +976,14 @@ class App:
                         or now - w.last_alert < u.s.cooldown * 60):
                     continue
                 w.alerted, w.last_alert = True, now
+                UNITS.set(u.s.units)
                 out.append((cid, self.watch_text(m, met, w, u.s, now - w.ok_since)))
         return out
 
     @staticmethod
     def watch_text(m: Market, met: Metrics, w: Watch, s: Settings, held: float) -> str:
         return (f"🎯 <b>{html.escape(m.label)}</b> — спред сузился\n\n"
-                f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · порог {w.spread:g}% · "
+                f"Спред: <b>{fmt_pct(met.spread_pct)}</b> ({met.spread_ticks:g} тик.) · порог {fmt_thr(w.spread)} · "
                 f"держится {held:.0f} с\n"
                 f"bid {fmt_price(met.bid, m)} / ask {fmt_price(met.ask, m)}\n"
                 f"Проскальзывание на {fmt_usd(s.size)}: buy {fmt_pct(met.buy_impact)} / sell {fmt_pct(met.sell_impact)}\n\n"
@@ -974,7 +993,7 @@ class App:
         if not u.watches:
             return ("🎯 Наблюдений нет.\n\n"
                     "<code>/watch NVDA</code> — напишу, когда спред по NVDA станет ≤ твоего spread "
-                    f"({u.s.spread:g}%)\n"
+                    f"({fmt_thr(u.s.spread)})\n"
                     "<code>/watch NVDA 0.01</code> — свой порог, %\n"
                     "По умолчанию слежу сразу на всех биржах, где есть пара (RH, Core, Entropy), "
                     "только одна: <code>/watch NVDA rh</code> · <code>core</code> · <code>entropy</code>")
@@ -984,7 +1003,7 @@ class App:
             m = self.find_market(base, ex)
             met = self.metrics_for(m, u.s) if m else None
             now_s = f"сейчас {fmt_pct(met.spread_pct)}" if met else "стакан недоступен"
-            lines.append(f"{html.escape(base)} · {EXCHANGES.get(ex, (ex,))[0]}: ждём ≤ {w.spread:g}% ({now_s})")
+            lines.append(f"{html.escape(base)} · {EXCHANGES.get(ex, (ex,))[0]}: ждём ≤ {fmt_thr(w.spread)} ({now_s})")
         lines.append("\nУбрать: /unwatch NVDA · /unwatch all")
         return "\n".join(lines)
 
@@ -996,8 +1015,10 @@ class App:
             low = a.lower().rstrip("%").replace(",", ".")
             if low in ("rh", "core", "entropy"):
                 ex = low
-            elif re.fullmatch(r"\d+(\.\d+)?|\.\d+", low):
-                spread = float(low)
+            elif re.fullmatch(r"(\d+(\.\d+)?|\.\d+)(bps)?", low):
+                spread = float(low.removesuffix("bps"))
+                if u.s.units == "bps" or low.endswith("bps"):
+                    spread /= 100
             else:
                 ticker = a
         if not ticker:
@@ -1021,7 +1042,7 @@ class App:
             now_s = f"сейчас {fmt_pct(met.spread_pct)} ({met.spread_ticks:g} тик.)" if met else "стакан загружается"
             lines.append(f"▫️ {EXCHANGES[e][0]}: {now_s}")
         base = found[0][1].base
-        return (f"🎯 Слежу за <b>{html.escape(base)}</b>: напишу, когда спред будет ≤ {spread:g}% "
+        return (f"🎯 Слежу за <b>{html.escape(base)}</b>: напишу, когда спред будет ≤ {fmt_thr(spread)} "
                 f"{u.s.hold:g} с подряд" + (" — по каждой бирже отдельно" if len(found) > 1 else "") + ".\n"
                 + "\n".join(lines) + "\n\n"
                 "Наблюдение не снимается само: повторю, когда спред расширится и снова сузится "
@@ -1066,12 +1087,12 @@ class App:
                 avg_h, h = full["hours"][0]
                 days = full["span"] / 86400
                 best_line = (f"Исторически самый узкий спред: {h:02d}:00–{(h + 1) % 24:02d}:00 МСК "
-                             f"(в среднем {avg_h:.4f}%, по данным за {days:.0f} дн.)")
+                             f"(в среднем {fmt_pct(avg_h)}, по данным за {days:.0f} дн.)")
             else:
                 left = 24 - (full["span"] / 3600 if full else 0)
                 best_line = f"Лучшее время по спреду появится, когда накопится история (ещё ~{max(left, 1):.0f} ч)"
-            lines = [f"Средний {st['avg']:.4f}% · мин {st['min']:.4f}% · макс {st['max']:.4f}% · медиана {mt} тик.",
-                     f"Не шире твоего порога {u.s.spread:g}%: {st['below']:.0f}% времени",
+            lines = [f"Средний {fmt_pct(st['avg'])} · мин {fmt_pct(st['min'])} · макс {fmt_pct(st['max'])} · медиана {mt} тик.",
+                     f"Не шире твоего порога {fmt_thr(u.s.spread)}: {st['below']:.0f}% времени",
                      best_line]
             step = 0 if period <= 6 * 3600 else 300 if period <= 86400 else 900 if period <= 2 * 86400 else H.COARSE
             series.append(status_image.Series(name, H.points(bks, step), lines) if status_image else None)
@@ -1097,7 +1118,7 @@ class App:
             png = status_image.render_history(
                 f"{base} · история спреда за {per}",
                 " · ".join(x.tag for x in series) + " · время МСК" + note,
-                series, threshold=u.s.spread, t0=now - period, t1=now)
+                series, threshold=u.s.spread, t0=now - period, t1=now, bps=u.s.units == "bps")
             return png, caption, plain
         return plain
 
@@ -1129,8 +1150,8 @@ class App:
             ok = passes(om, s)
             diff = (om.mid / base_met.mid - 1) * 100 if base_met else 0
             where = "выше" if diff > 0 else "ниже"
-            price = f"цена там на {abs(diff):.3f}% {where}" if abs(diff) >= 0.0005 else "цена та же"
-            fee = f", комиссия {o.taker_fee:g}%" if o.taker_fee else ""
+            price = f"цена там на {fmt_pct(abs(diff), 3)} {where}" if abs(diff) >= 0.0005 else "цена та же"
+            fee = f", комиссия {fmt_thr(o.taker_fee)}" if o.taker_fee else ""
             out.append((o.ex_name, f"На {o.ex_name}: спред {fmt_pct(om.spread_pct)} ({om.spread_ticks:g} тик.), "
                                    f"impact {fmt_pct(om.impact)}{fee}, {price}" + (" ✅" if ok else ""), ok))
         return out
@@ -1173,12 +1194,13 @@ class App:
                     u = self.users.get(cid)
                     if not u:
                         continue
+                    UNITS.set(u.s.units)
                     parts = [self.good_text(m, met, held, u.s, twin) for m, met, held, twin in good_new]
                     if u.s.notify_lost:
                         parts += [self.lost_text(m, met, u.s) for m, met in lost]
                     if parts:
                         await self.send("\n\n".join(parts), [cid])
-                for cid, text in self.evaluate_watches(time.time()):
+                for cid, text in self.evaluate_watches(time.time()):   # тексты уже в единицах пользователя
                     await self.send(text, [cid])
             except Exception:  # noqa: BLE001
                 log.exception("Ошибка в цикле оценки")
@@ -1189,8 +1211,8 @@ class App:
     def settings_text(u: User) -> str:
         s = u.s
         return ("⚙️ <b>Твои фильтры</b>\n"
-                f"spread ≤ {s.spread:g}%\n"
-                f"impact ≤ {s.impact:g}% на size {fmt_usd(s.size)}\n"
+                f"spread ≤ {fmt_thr(s.spread)}\n"
+                f"impact ≤ {fmt_thr(s.impact)} на size {fmt_usd(s.size)}\n"
                 f"depth ≥ {fmt_usd(s.depth)} на сторону в band ±{s.band:g}%\n"
                 f"hold {s.hold:g} с · cooldown {s.cooldown:g} мин\n"
                 f"grace {s.grace:g} с · notify_lost {'on' if s.notify_lost else 'off'}\n"
@@ -1212,11 +1234,11 @@ class App:
         ok = sum(1 for _, met in rows if passes(met, s))
         name = EXCHANGES[ex][0]
         out = [f"📊 <b>{name}: топ-{min(top, len(rows))} по спреду</b> (проходят фильтры: {ok}/{len(rows)})",
-               "<code>" + html.escape(f"{'Спред%':>8}{'Тик':>4}{'Проск.':>7}{'Глуб.':>6}") + "</code>"]
+               "<code>" + html.escape(f"{('Спред bp' if bps_mode() else 'Спред%'):>8}{'Тик':>4}{'Проск.':>7}{'Глуб.':>6}") + "</code>"]
         for m, met in rows[:top]:
             out.append(f"<b>{html.escape(m.symbol)}</b>" + (" ✅" if passes(met, s) else ""))
             out.append("<code>" + html.escape(self._row("", met, 0)) + "</code>")
-        out.append(f"\nПроск. — проскальзывание на {fmt_usd(s.size)}, %, "
+        out.append(f"\nПроск. — проскальзывание на {fmt_usd(s.size)}, {'bps' if bps_mode() else '%'}, "
                    f"глубина — меньшая из сторон в ±{s.band:g}%")
         return "\n".join(out)
 
@@ -1263,7 +1285,7 @@ class App:
         if not groups:
             return None
         png = status_image.render_status(title, groups, spread=s.spread, impact=s.impact, depth=s.depth,
-                                         size=s.size, band=s.band)
+                                         size=s.size, band=s.band, bps=s.units == "bps")
         return png, caption
 
     def status_merged(self, u: User, top: int) -> str:
@@ -1285,7 +1307,7 @@ class App:
         names = [EXCHANGES[e][0] for e in exs]
         w = max(len(n) for n in names) + 1
         out = [f"📊 <b>Топ-{min(top, len(rows))} акций по спреду, {join_names(names)}</b>",
-               "<code>" + html.escape(f"{'':{w}}{'Спред%':>8}{'Тик':>4}{'Проск.':>7}{'Глуб.':>6}") + "</code>"]
+               "<code>" + html.escape(f"{'':{w}}{('Спред bp' if bps_mode() else 'Спред%'):>8}{'Тик':>4}{'Проск.':>7}{'Глуб.':>6}") + "</code>"]
         ok = 0
         for base, mets in rows[:top]:
             out.append(f"\n<b>{html.escape(base)}</b>")
@@ -1298,23 +1320,25 @@ class App:
                 good = passes(met, s)
                 ok += good
                 out.append("<code>" + html.escape(self._row(tag, met, w)) + "</code>" + (" ✅" if good else ""))
-        out.append(f"\n✅ проходят фильтры: {ok}. Проск. — проскальзывание на {fmt_usd(s.size)}, %, "
+        out.append(f"\n✅ проходят фильтры: {ok}. Проск. — проскальзывание на {fmt_usd(s.size)}, {'bps' if bps_mode() else '%'}, "
                    f"глубина — меньшая из сторон в ±{s.band:g}%, — — пары нет на этой бирже.\n"
                    "Только одна биржа: " + " · ".join(f"/status_{e}" for e in exs))
         return "\n".join(out)
 
     @staticmethod
     def _row(tag: str, met: Metrics, w: int) -> str:
-        imp = "∞" if math.isinf(met.impact) else f"{met.impact:.3f}"
-        return f"{tag:<{w}}{met.spread_pct:>8.4f}{met.spread_ticks:>4g}{imp:>7}{fmt_usd(met.depth):>6}"
+        k = 100 if bps_mode() else 1
+        imp = "∞" if math.isinf(met.impact) else f"{met.impact * k:.{1 if k > 1 else 3}f}"
+        sp = met.spread_pct * k
+        return f"{tag:<{w}}{sp:>8.{2 if k > 1 else 4}f}{met.spread_ticks:>4g}{imp:>7}{fmt_usd(met.depth):>6}"
 
     def welcome_text(self, u: User) -> str:
         s = u.s
         return ("👋 <b>Привет!</b> Я слежу за стаканами всех акций и pre-IPO на Lighter Robinhood "
                 "и пишу, когда по паре можно зайти почти без потерь на спреде.\n\n"
                 "Каждую секунду проверяю у каждой пары:\n"
-                f"▫️ спред ≤ {s.spread:g}%\n"
-                f"▫️ рыночная заявка на {fmt_usd(s.size)} сдвинет цену не больше чем на {s.impact:g}%\n"
+                f"▫️ спред ≤ {fmt_thr(s.spread)}\n"
+                f"▫️ рыночная заявка на {fmt_usd(s.size)} сдвинет цену не больше чем на {fmt_thr(s.impact)}\n"
                 f"▫️ в ±{s.band:g}% от цены стоит минимум {fmt_usd(s.depth)} на покупку и на продажу\n\n"
                 f"Если всё держится {s.hold:g} с — пришлю 🟢 с цифрами, когда уйдёт — 🔴.\n\n"
                 "Командой /core можно добавить сравнение с основным Lighter: в алертах и /status будет видно, "
@@ -1337,6 +1361,7 @@ class App:
                 "<code>/watch NVDA 0.01</code> — свой порог, /watch — список, /unwatch NVDA — убрать\n"
                 "/pause · /resume — выключить и включить алерты\n"
                 "/core — добавить или убрать сравнение с основным Lighter (Core)\n"
+                "/bps — показывать спред в базисных пунктах вместо % (1 bps = 0.01%), ещё раз — обратно\n"
                 "/entropy — добавить или убрать сравнение с Entropy (.io)\n"
                 "/reset — вернуть настройки по умолчанию\n"
                 "/help — эта справка")
@@ -1365,6 +1390,7 @@ class App:
             await self.send(self.welcome_text(u), [chat_id])
             if cmd == "/start":
                 return
+        UNITS.set(u.s.units)
         if cmd == "/start":
             reply = self.welcome_text(u)
         elif cmd == "/help":
@@ -1414,6 +1440,14 @@ class App:
                          "В /status — обе биржи. /core — убрать."
                          if u.s.venue == "both" else
                          "➖ Core убран: снова только Lighter RH. /core — вернуть.")
+        elif cmd in ("/bps", "/pct"):
+            u.s.units = "pct" if (cmd == "/pct" or u.s.units == "bps") else "bps"
+            UNITS.set(u.s.units)
+            reply = ("📏 Теперь спред и проскальзывание — в <b>базисных пунктах</b> (1 bps = 0.01%). "
+                     "Пороги в /set и /watch тоже вводи в bps: <code>/set spread 0.5</code> = 0.005%. "
+                     "Вернуть проценты: /bps"
+                     if u.s.units == "bps" else
+                     "📏 Снова проценты. Пороги в /set и /watch — в %. Базисные пункты: /bps")
         elif cmd == "/entropy":
             if "entropy" not in EXCHANGES:
                 reply = "Мониторинг Entropy сейчас выключен на уровне бота."
@@ -1462,6 +1496,8 @@ class App:
             return "Формат: <code>/set spread 0.005</code>\n\n" + "\n".join(
                 f"<code>{k}</code> — {v}" for k, v in SETTING_HELP.items())
         key, raw = args[0].lower(), args[1].replace(",", ".").replace("%", "").replace("$", "")
+        in_bps = key in ("spread", "impact") and (u.s.units == "bps" or raw.lower().endswith("bps"))
+        raw = re.sub(r"(?i)\s*bps$", "", raw)
         try:
             if key == "notify_lost":
                 val = raw.lower() in ("on", "1", "true", "yes", "да", "вкл")
@@ -1475,6 +1511,8 @@ class App:
                     return "band — не больше 5%."
         except ValueError:
             return "Не понял значение."
+        if in_bps and isinstance(val, float):
+            val /= 100
         setattr(u.s, key, val)
         for st in u.pairs.values():  # переоценить с нуля по новым порогам
             st.ok_since = None
@@ -1489,6 +1527,7 @@ class App:
             {"command": "settings", "description": "Мои фильтры"},
             {"command": "help", "description": "Как настроить (/set)"},
             {"command": "pairs", "description": "Пары в мониторинге"},
+            {"command": "bps", "description": "Спред в базисных пунктах / в %"},
             {"command": "history", "description": "История спреда: /history NVDA 7d"},
             {"command": "watch", "description": "Алерт по тикеру на RH и Core: /watch NVDA 0.01"},
             {"command": "unwatch", "description": "Убрать наблюдение по тикеру"},

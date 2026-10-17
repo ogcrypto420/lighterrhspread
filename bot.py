@@ -29,6 +29,8 @@ from pathlib import Path
 
 import aiohttp
 
+import history as H
+
 try:  # картинка для /status (если Pillow нет — бот пришлёт текст)
     import status_image
 except Exception:  # noqa: BLE001
@@ -111,7 +113,9 @@ EVAL_INTERVAL_SEC = env_float("EVAL_INTERVAL_SEC", 1.0)
 DATA_DIR = Path(env_str("DATA_DIR", str(HERE)))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 SETTINGS_FILE = DATA_DIR / "settings.json"
-STATE_FILE = DATA_DIR / "state.json"   # чтобы после перезапуска не дублировать алерты
+STATE_FILE = DATA_DIR / "state.json"
+HISTORY_FILE = DATA_DIR / "history.json"   # история спреда для /history
+HISTORY_SAMPLE_SEC = env_float("HISTORY_SAMPLE_SEC", 5)   # чтобы после перезапуска не дублировать алерты
 # Через сколько минут бот сам корректно завершится (0 — работать бесконечно).
 # Нужно для GitHub Actions, где один запуск живёт максимум 6 часов.
 MAX_RUNTIME_MIN = env_float("MAX_RUNTIME_MIN", 0)
@@ -288,6 +292,11 @@ def parse_markets(data: dict, ex: str = "rh") -> dict[str, Market]:
 def norm_ticker(t: str) -> str:
     t = t.upper().lstrip("$").split(":")[-1]
     return ENTROPY_ALIASES.get(t, ALIASES.get(t, t))
+
+
+def s_extras_or_entropy(s: "Settings") -> list[str]:
+    """Для /history: биржи сравнения пользователя; если ничего не включено — Entropy (если пара там есть)."""
+    return s.extras() or ["entropy"]
 
 
 def join_names(names: list[str]) -> str:
@@ -557,6 +566,7 @@ class App:
         self.tg_offset = 0
         self.known_ids: set[str] = set()
         self.restored = self.load_state()
+        self.hist = H.History(HISTORY_FILE)
         for cid in TG_CHAT_IDS:  # владелец подписан всегда
             self.users.setdefault(cid, User(cid))
         self._migrate_legacy_settings()
@@ -1023,6 +1033,63 @@ class App:
                 f"(не чаще раза в {u.s.cooldown:g} мин). Работает и на /pause.\n"
                 f"Снять: /unwatch {html.escape(base)} · все наблюдения: /watch")
 
+    def history_reply(self, u: User, args: list[str]):
+        """/history NVDA [24h|7d|12h|3d] [rh|core|entropy] → (png, подпись, текст) или текст."""
+        if not args:
+            return ("📈 <b>История спреда</b>: <code>/history NVDA</code> — за сутки, "
+                    "<code>/history NVDA 7d</code> — за неделю (можно 6h, 3d…), "
+                    "<code>/history NVDA entropy</code> — только одна биржа.")
+        ticker, period, only = None, 86400, None
+        for a in args:
+            low = a.lower()
+            if low in ("rh", "core", "entropy"):
+                only = low
+            elif re.fullmatch(r"\d+[hdчд]", low):
+                n = int(low[:-1])
+                period = n * (3600 if low[-1] in "hч" else 86400)
+            else:
+                ticker = a
+        period = min(max(period, 3600), H.KEEP_DAYS * 86400)
+        if not ticker:
+            return "Укажи тикер: <code>/history NVDA</code>"
+        base = norm_ticker(ticker)
+        exs = [only] if only else ["rh"] + [e for e in s_extras_or_entropy(u.s) if e in EXCHANGES]
+        now = time.time()
+        series, text = [], []
+        for ex in exs:
+            bks = self.hist.buckets(f"{ex}:{base}", period, now)
+            st = H.stats(bks, u.s.spread)
+            if not st:
+                continue
+            name = EXCHANGES.get(ex, (ex.upper(),))[0]
+            mt = "∞" if math.isinf(st["median_ticks"]) else f"{st['median_ticks']:g}"
+            best = ", ".join(f"{h:02d}–{(h + 1) % 24:02d}" for _, h in st["hours"][:3])
+            lines = [f"Средний {st['avg']:.4f}% · мин {st['min']:.4f}% · макс {st['max']:.4f}% · медиана {mt} тик.",
+                     f"Не шире твоего порога {u.s.spread:g}%: {st['below']:.0f}% времени",
+                     f"Самые узкие часы (МСК): {best}"]
+            series.append(status_image.Series(name, H.points(bks), lines) if status_image else None)
+            text.append(f"<b>{name}</b>\n" + "\n".join(lines))
+        if not text:
+            m_any = any(self.find_market(base, e) for e in EXCHANGES)
+            if not m_any:
+                return f"Не нашёл {html.escape(base)} среди пар в мониторинге. Список: /pairs"
+            started = (time.strftime("%d.%m %H:%M", time.gmtime(self.hist.since + 3 * 3600)))
+            return (f"📈 По {html.escape(base)} истории пока нет: бот копит её с {started} МСК. "
+                    "Попробуй через несколько минут.")
+        got = max(H.stats(self.hist.buckets(f"{ex}:{base}", period, now), u.s.spread)["span"]
+                  for ex in exs if self.hist.buckets(f"{ex}:{base}", period, now))
+        per = f"{period // 86400} дн." if period > 86400 else f"{period // 3600} ч"
+        note = "" if got >= period * 0.9 else f" (данные есть за {got / 3600:.1f} ч — история копится)"
+        caption = f"📈 <b>{html.escape(base)}</b>: спред за {per}{note}"
+        plain = caption + "\n\n" + "\n\n".join(text)
+        if status_image and all(series):
+            png = status_image.render_history(
+                f"{base} · история спреда за {per}",
+                " · ".join(x.tag for x in series) + " · время МСК" + note,
+                series, threshold=u.s.spread, t0=now - period, t1=now)
+            return png, caption, plain
+        return plain
+
     def apply_unwatch(self, u: User, args: list[str]) -> str:
         if not args or args[0].lower() in ("all", "все"):
             n = len(u.watches)
@@ -1253,6 +1320,8 @@ class App:
                 "/status — топ пар по спреду прямо сейчас\n"
                 "/settings — твои текущие фильтры\n"
                 "/pairs — пары в мониторинге\n"
+                "/history NVDA — история спреда по паре (график, средний спред, лучшие часы); "
+                "<code>/history NVDA 7d</code> — за неделю\n"
                 "/watch NVDA — напишу, когда спред по паре сузится (например, чтобы выйти из сделки); "
                 "<code>/watch NVDA 0.01</code> — свой порог, /watch — список, /unwatch NVDA — убрать\n"
                 "/pause · /resume — выключить и включить алерты\n"
@@ -1356,6 +1425,17 @@ class App:
             reply = "♻️ Настройки сброшены.\n\n" + self.settings_text(u)
         elif cmd == "/set":
             reply = self.apply_set(u, args)
+        elif cmd == "/history":
+            res = self.history_reply(u, args)
+            if isinstance(res, tuple):
+                try:
+                    if await self.send_photo(chat_id, res[0], res[1]):
+                        return
+                except Exception:  # noqa: BLE001
+                    log.exception("Не удалось отправить /history картинкой")
+                reply = res[2]
+            else:
+                reply = res
         elif cmd == "/watch":
             reply = self.apply_watch(u, args)
         elif cmd == "/unwatch":
@@ -1398,6 +1478,7 @@ class App:
             {"command": "settings", "description": "Мои фильтры"},
             {"command": "help", "description": "Как настроить (/set)"},
             {"command": "pairs", "description": "Пары в мониторинге"},
+            {"command": "history", "description": "История спреда: /history NVDA 7d"},
             {"command": "watch", "description": "Алерт по тикеру на RH и Core: /watch NVDA 0.01"},
             {"command": "unwatch", "description": "Убрать наблюдение по тикеру"},
             {"command": "pause", "description": "Выключить алерты"},
@@ -1427,9 +1508,37 @@ class App:
                 await asyncio.sleep(5)
 
     async def autosave_loop(self) -> None:
+        n = 0
         while True:
             await asyncio.sleep(30)
             self.save_state()
+            n += 1
+            if n % 10 == 0:          # историю — раз в 5 минут
+                self.save_history()
+
+    def save_history(self) -> None:
+        try:
+            self.hist.save()
+        except Exception as e:  # noqa: BLE001
+            log.warning("history.json не сохранён: %s", e)
+
+    async def history_loop(self) -> None:
+        """Каждые несколько секунд записываем спред всех пар — Lighter историю стакана не хранит."""
+        await asyncio.sleep(10)
+        while True:
+            now = time.time()
+            for m in list(self.markets.values()):
+                book = self.books.get(m.key)
+                if not book or not book.ready or not book.bids or not book.asks:
+                    continue
+                if now - book.updated > 120 and m.ex != "entropy" and book.updated:
+                    continue
+                bid, ask = max(book.bids), min(book.asks)
+                if ask <= bid:
+                    continue
+                mid = (ask + bid) / 2
+                self.hist.add(f"{m.ex}:{m.base}", now, (ask - bid) / mid * 100, (ask - bid) / m.tick, mid, m.tick)
+            await asyncio.sleep(HISTORY_SAMPLE_SEC)
 
     WATCHDOG_SEC = 240
 
@@ -1446,6 +1555,7 @@ class App:
                     log.error("Бот не опрашивал Telegram %.0f с — завис, перезапускаюсь", stale)
                     try:
                         self.save_state()
+                        self.save_history()
                     except Exception:  # noqa: BLE001
                         log.exception("Не удалось сохранить состояние перед перезапуском")
                     os._exit(3)
@@ -1455,7 +1565,8 @@ class App:
     async def run(self) -> None:
         self.start_watchdog()
         async with aiohttp.ClientSession() as self.http:
-            loops = asyncio.gather(self.markets_loop(), self.eval_loop(), self.tg_loop(), self.autosave_loop())
+            loops = asyncio.gather(self.markets_loop(), self.eval_loop(), self.tg_loop(), self.autosave_loop(),
+                                   self.history_loop())
             try:
                 if MAX_RUNTIME_MIN > 0:
                     try:
@@ -1468,6 +1579,7 @@ class App:
                 for t in self.feeds:
                     t.cancel()
                 self.save_state()
+                self.save_history()
 
 
 def main() -> None:

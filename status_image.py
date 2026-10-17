@@ -165,3 +165,125 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
     buf = io.BytesIO()
     img.save(buf, "PNG", optimize=True)
     return buf.getvalue()
+
+
+# ───────────────────────────── /history: график спреда ─────────────────────────────
+
+@dataclass
+class Series:
+    tag: str                                        # "RH" / "CORE" / "ENTROPY"
+    points: list[tuple[float, float, float, float]]  # (unix-время, средний, мин, макс спред %)
+    lines: list[str]                                # строки статистики под графиком
+
+
+MSK = 3 * 3600
+TAG_COLORS = {"RH": TAG_RH, "CORE": TAG_CORE, "ENTROPY": TAG_ENTROPY}
+
+
+def _blend(c, bg, a):
+    return tuple(int(bg[i] + (c[i] - bg[i]) * a) for i in range(3))
+
+
+def render_history(title: str, subtitle: str, series: list[Series], *, threshold: float,
+                   t0: float, t1: float) -> bytes:
+    s = SCALE
+    f_title = _font("Inter-Bold.otf", 26)
+    f_sub = _font("Inter-Regular.otf", 15)
+    f_axis = _font("Inter-Regular.otf", 13)
+    f_tag = _font("Inter-Bold.otf", 12)
+    f_line = _font("Inter-Regular.otf", 15)
+
+    head_h, chart_h = 112, 330
+    text_h = sum(30 + 24 * len(x.lines) for x in series) + 16
+    H = head_h + chart_h + 60 + text_h + 40
+    img = Image.new("RGB", (W * s, H * s), BG)
+    d = ImageDraw.Draw(img)
+    d.text((PAD * s, 26 * s), title, font=f_title, fill=TEXT)
+    d.text((PAD * s, 66 * s), subtitle, font=f_sub, fill=MUTED)
+
+    # область графика
+    left, right = PAD + 64, W - PAD - 16
+    top, bottom = head_h + 16, head_h + chart_h
+    d.rounded_rectangle([PAD * s, head_h * s, (W - PAD) * s, (bottom + 46) * s], radius=16 * s, fill=CARD)
+
+    avgs = sorted(p[1] for x in series for p in x.points) or [threshold]
+    p98 = avgs[min(len(avgs) - 1, int(len(avgs) * 0.98))]
+    ymax = max(threshold * 1.6, p98 * 1.25, 1e-6)
+
+    def X(t):
+        return (left + (t - t0) / max(t1 - t0, 1) * (right - left)) * s
+
+    def Y(v):
+        return (bottom - min(v, ymax) / ymax * (bottom - top)) * s
+
+    # сетка и ось Y
+    for i in range(5):
+        v = ymax * i / 4
+        y = Y(v)
+        d.line([(left * s, y), (right * s, y)], fill=LINE, width=s)
+        lab = f"{v:.3f}" if ymax < 0.1 else f"{v:.2f}"
+        d.text(((left - 8) * s - d.textlength(lab, font=f_axis), y - 9 * s), lab, font=f_axis, fill=MUTED)
+    # ось X: подписи по МСК
+    span = t1 - t0
+    step = 3600 * (3 if span <= 26 * 3600 else 24 if span <= 8 * 86400 else 48)
+    if span <= 7 * 3600:
+        step = 3600
+    t = (int(t0 + MSK) // step + 1) * step - MSK
+    while t < t1:
+        x = X(t)
+        d.line([(x, top * s), (x, bottom * s)], fill=_blend(LINE, CARD, 0.6), width=s)
+        msk = datetime.fromtimestamp(t, timezone.utc) + timedelta(hours=3)
+        lab = f"{msk:%H:%M}" if step < 86400 else f"{msk:%d.%m}"
+        d.text((x - d.textlength(lab, font=f_axis) / 2, (bottom + 10) * s), lab, font=f_axis, fill=MUTED)
+        t += step
+    d.text(((right) * s - d.textlength("МСК", font=f_axis), (bottom + 26) * s), "МСК", font=f_axis, fill=MUTED)
+
+    # линии: коридор мин–макс и средний спред
+    for x_ in reversed(series):          # RH рисуем последним — поверх
+        col = TAG_COLORS.get(x_.tag, TAG_CORE)
+        pts = sorted(x_.points)
+        diffs = sorted(b[0] - a[0] for a, b in zip(pts, pts[1:])) or [300]
+        gap = max(601, 2.5 * diffs[len(diffs) // 2], 1801 * 1.5 if span > 86400 * 1.1 else 0)
+        seg: list[tuple] = []
+        segments = []
+        for p in pts:
+            if seg and p[0] - seg[-1][0] > gap:
+                segments.append(seg)
+                seg = []
+            seg.append(p)
+        if seg:
+            segments.append(seg)
+        for sg in segments:
+            if len(sg) >= 2:
+                d.line([(X(p[0]), Y(p[1])) for p in sg], fill=col, width=s * 2, joint="curve")
+            else:
+                p = sg[0]
+                d.ellipse([X(p[0]) - 3 * s, Y(p[1]) - 3 * s, X(p[0]) + 3 * s, Y(p[1]) + 3 * s], fill=col)
+
+    # порог пользователя — пунктир
+    yt = Y(threshold)
+    x = left * s
+    while x < right * s:
+        d.line([(x, yt), (min(x + 8 * s, right * s), yt)], fill=GREEN, width=s * 2)
+        x += 14 * s
+    lab = f"порог {threshold:g}%"
+    d.text(((left + 6) * s, yt - 20 * s), lab, font=f_axis, fill=GREEN)
+
+    # статистика под графиком
+    y = bottom + 46 + 22
+    for x_ in series:
+        col = TAG_COLORS.get(x_.tag, TAG_CORE)
+        tw = d.textlength(x_.tag, font=f_tag)
+        d.rounded_rectangle([PAD * s, y * s, PAD * s + tw + 16 * s, (y + 19) * s], radius=9 * s, outline=col, width=s)
+        d.text((PAD * s + 8 * s, (y + 3) * s), x_.tag, font=f_tag, fill=col)
+        y += 30
+        for ln in x_.lines:
+            d.text((PAD * s, y * s), ln, font=f_line, fill=TEXT)
+            y += 24
+        y += 8
+    d.text((PAD * s, (H - 34) * s), "Линия — средний спред за 5 минут" +
+           (" (старше суток — за 30 минут)" if span > 86400 * 1.1 else ""), font=f_axis, fill=MUTED)
+
+    buf = io.BytesIO()
+    img.save(buf, "PNG", optimize=True)
+    return buf.getvalue()

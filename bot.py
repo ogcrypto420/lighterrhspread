@@ -1156,7 +1156,8 @@ class App:
             for m in self.markets.values():
                 if m.mtype == "perp" and m.ex in exs and (met := self.metrics_for(m, s)):
                     by_base.setdefault(m.base, {})[m.ex] = met
-            by_base = {b: v for b, v in by_base.items() if "rh" in v}
+            need = ["rh"] + (["entropy"] if "entropy" in exs else [])
+            by_base = {b: v for b, v in by_base.items() if all(e in v for e in need)}
             rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))[:top]
             for base, mets in rows:
                 cells = []
@@ -1198,6 +1199,8 @@ class App:
             met = self.metrics_for(m, s)
             if met:
                 by_base.setdefault(m.base, {})[m.ex] = met
+        if "entropy" in exs:                       # с Entropy — только пары, что есть на обеих биржах
+            by_base = {b: v for b, v in by_base.items() if "rh" in v and "entropy" in v}
         if not by_base:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))
@@ -1322,9 +1325,11 @@ class App:
                 reply = "Мониторинг Core сейчас выключен на уровне бота."
             else:
                 u.s.venue = "rh" if u.s.venue == "both" else "both"
+                if u.s.venue == "both":
+                    u.s.entropy = False          # сравнение одно: RH ↔ Core или RH ↔ Entropy
                 for st in u.pairs.values():
                     st.ok_since = None
-                reply = ("➕ Core добавлен. Алерты по-прежнему по Lighter RH, но в каждом видна та же акция "
+                reply = ("➕ Core добавлен (Entropy убран). Алерты по-прежнему по Lighter RH, но в каждом видна та же акция "
                          "на основном Lighter, а если пара хороша на обеих биржах — придёт 🟢🟢. "
                          "В /status — обе биржи. /core — убрать."
                          if u.s.venue == "both" else
@@ -1334,12 +1339,14 @@ class App:
                 reply = "Мониторинг Entropy сейчас выключен на уровне бота."
             else:
                 u.s.entropy = not u.s.entropy
+                if u.s.entropy:
+                    u.s.venue = "rh"             # сравнение одно: RH ↔ Entropy, без Core
                 for st in u.pairs.values():
                     st.ok_since = None
                 common = sorted({m.base for m in self.markets.values() if m.ex == "entropy"})
-                reply = (("➕ Entropy добавлен. Алерты по-прежнему по Lighter RH, но в каждом видна та же акция "
-                          "на Entropy (Hyperliquid), а если пара хороша и там — придёт 🟢🟢. "
-                          "В /status — эта биржа тоже, /status_entropy — только она.\n"
+                reply = (("➕ Сравнение RH ↔ Entropy включено (Core убран). Алерты по-прежнему по Lighter RH; "
+                          "если акция есть на Entropy (Hyperliquid), в алерте видна она же там, а если пара хороша "
+                          "на обеих биржах — придёт 🟢🟢. В /status — только общие пары RH и Entropy.\n"
                           f"Общие с RH пары: {', '.join(common) or 'пока нет'}.\n"
                           "На Entropy есть комиссия тейкера — она видна в строке сравнения. /entropy — убрать.")
                          if u.s.entropy else "➖ Entropy убран. /entropy — вернуть.")

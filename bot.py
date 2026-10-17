@@ -1078,7 +1078,10 @@ class App:
                   for ex in exs if self.hist.buckets(f"{ex}:{base}", period, now))
         per = f"{period // 86400} дн." if period > 86400 else f"{period // 3600} ч"
         note = "" if got >= period * 0.9 else f" (данные есть за {got / 3600:.1f} ч — история копится)"
-        caption = f"📈 <b>{html.escape(base)}</b>: спред за {per}{note}"
+        t = html.escape(base)
+        caption = (f"📈 <b>{t}</b>: спред за {per}{note}\n\n"
+                   f"Посмотреть за час или за несколько дней: <code>/history {t} 1h</code> · "
+                   f"<code>/history {t} 6h</code> · <code>/history {t} 3d</code> · <code>/history {t} 7d</code>")
         plain = caption + "\n\n" + "\n\n".join(text)
         if status_image and all(series):
             png = status_image.render_history(

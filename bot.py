@@ -1060,10 +1060,19 @@ class App:
                 continue
             name = EXCHANGES.get(ex, (ex.upper(),))[0]
             mt = "∞" if math.isinf(st["median_ticks"]) else f"{st['median_ticks']:g}"
-            best = ", ".join(f"{h:02d}–{(h + 1) % 24:02d}" for _, h in st["hours"][:3])
+            # лучшее время — по всей накопленной истории (до 7 дней), когда её хотя бы сутки
+            full = H.stats(self.hist.buckets(f"{ex}:{base}", H.KEEP_DAYS * 86400, now), u.s.spread)
+            if full and full["span"] >= 86400 and full["hours"]:
+                avg_h, h = full["hours"][0]
+                days = full["span"] / 86400
+                best_line = (f"Исторически самый узкий спред: {h:02d}:00–{(h + 1) % 24:02d}:00 МСК "
+                             f"(в среднем {avg_h:.4f}%, по данным за {days:.0f} дн.)")
+            else:
+                left = 24 - (full["span"] / 3600 if full else 0)
+                best_line = f"Лучшее время по спреду появится, когда накопится история (ещё ~{max(left, 1):.0f} ч)"
             lines = [f"Средний {st['avg']:.4f}% · мин {st['min']:.4f}% · макс {st['max']:.4f}% · медиана {mt} тик.",
                      f"Не шире твоего порога {u.s.spread:g}%: {st['below']:.0f}% времени",
-                     f"Самые узкие часы (МСК): {best}"]
+                     best_line]
             step = 0 if period <= 6 * 3600 else 300 if period <= 86400 else 900 if period <= 2 * 86400 else H.COARSE
             series.append(status_image.Series(name, H.points(bks, step), lines) if status_image else None)
             text.append(f"<b>{name}</b>\n" + "\n".join(lines))

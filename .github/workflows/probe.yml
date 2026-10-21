@@ -4,34 +4,25 @@ jobs:
   probe:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
-      - run: pip install aiohttp
       - run: |
-          cat > p.py <<'PY'
-          import asyncio, json, aiohttp
+          for u in https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/supported_assets; do
+            echo "== $u"; curl -s -m 30 "$u" -o out.json -w "HTTP %{http_code}\n"; head -c 300 out.json; echo
+            python3 - <<'PY'
+          import json
+          try:
+              d = json.load(open("out.json"))
+          except Exception as e:
+              print("::notice::notjson " + str(e)); raise SystemExit
           def note(t):
-              for i in range(0, len(t), 3500):
-                  print("::notice::" + t[i:i+3500].replace("\n", " | "))
-          async def main():
-              async with aiohttp.ClientSession() as s:
-                  async def info(body):
-                      async with s.post("https://api.hyperliquid.xyz/info", json=body) as r:
-                          return await r.json(content_type=None)
-                  dexs = await info({"type": "perpDexs"})
-                  note("DEXS " + json.dumps([d and d.get("name") for d in dexs]))
-                  m = await info({"type": "metaAndAssetCtxs", "dex": "io"})
-                  u = m[0]["universe"]
-                  note("IO " + json.dumps([[x["name"], x["szDecimals"], x.get("isDelisted"), x.get("growthMode"), m[1][i].get("midPx")] for i, x in enumerate(u)]))
-                  async with s.get("https://api.rh.lighter.xyz/api/v1/orderBookDetails") as r:
-                      d = await r.json(content_type=None)
-                  note("RH " + json.dumps(sorted(x["symbol"] for x in d.get("order_book_details", []) if x.get("status") == "active")))
-                  coin = u[0]["name"]
-                  async with s.ws_connect("wss://api.hyperliquid.xyz/ws") as ws:
-                      await ws.send_json({"method": "subscribe", "subscription": {"type": "l2Book", "coin": coin}})
-                      for _ in range(3):
-                          msg = await ws.receive_json(timeout=15)
-                          note("WS " + json.dumps(msg)[:1500])
-          asyncio.run(main())
+              for i in range(0, len(t), 3500): print("::notice::" + t[i:i+3500])
+          if isinstance(d, dict) and "listings" in d:
+              L = d["listings"]
+              note("TICKERS %d " % len(L) + json.dumps(sorted(x.get("ticker") for x in L)))
+              note("SAMPLE " + json.dumps(L[0])[:3000])
+              stocks = [x for x in L if x.get("ticker") in ("NVDA","TSLA","AAPL","OPENAI","SNDK","GOOGL","META","AMZN","MSFT","COIN","PLTR","AAOI")]
+              for x in stocks[:3]: note("STOCK " + json.dumps(x)[:2000])
+              note("KEYS " + json.dumps(list(d.keys())))
+          else:
+              note("OTHER " + json.dumps(d)[:3000])
           PY
-          python p.py
+          done

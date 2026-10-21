@@ -25,6 +25,7 @@ import os
 import re
 import threading
 import time
+import zlib
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
@@ -95,7 +96,15 @@ HL_WS_URL = env_str("HL_WS_URL", "wss://api.hyperliquid.xyz/ws")
 ENTROPY_DEX = env_str("ENTROPY_DEX", "io")
 if ENABLE_ENTROPY:
     EXCHANGES["entropy"] = ("ENTROPY", HL_INFO_URL, HL_WS_URL)
-COMPARE_EXCHANGES = [e for e in ("core", "entropy") if e in EXCHANGES]   # с чем сравниваем RH
+# Variational (Omni) — RFQ-биржа без стакана: котировки bid/ask на $1k и $100k из публичного API
+ENABLE_VAR = env_bool("ENABLE_VAR", True)
+VAR_STATS_URL = env_str("VAR_STATS_URL",
+                        "https://omni-client-api.prod.ap-northeast-1.variational.io/metadata/stats")
+VAR_POLL_SEC = env_float("VAR_POLL_SEC", 3)
+if ENABLE_VAR:
+    EXCHANGES["var"] = ("VAR", VAR_STATS_URL, "")
+COMPARE_EXCHANGES = [e for e in ("core", "entropy", "var") if e in EXCHANGES]   # с чем сравниваем RH
+EX_KEYS = ("rh",) + tuple(COMPARE_EXCHANGES)
 # Тикеры Entropy → как на RH
 ENTROPY_ALIASES = {"OAI": "OPENAI", "ANTH": "ANTHROPIC"}
 # Тейкер-комиссия HIP-3 (база Hyperliquid 0.045% × 2); в growth mode — 10% от неё
@@ -159,10 +168,11 @@ class Settings:
     units: str = "pct"                                      # pct — проценты, bps — базисные пункты (/bps)
     venue: str = env_str("VENUE", "rh").lower()             # rh — только Robinhood, both — RH + Core (/core)
     entropy: bool = env_bool("SHOW_ENTROPY", False)         # сравнение с Entropy (/entropy)
+    var: bool = env_bool("SHOW_VAR", False)                 # сравнение с Variational (/var)
 
     def extras(self) -> list[str]:
         """С какими биржами пользователь сравнивает RH."""
-        on = {"core": self.venue == "both", "entropy": self.entropy}
+        on = {"core": self.venue == "both", "entropy": self.entropy, "var": self.var}
         return [e for e in COMPARE_EXCHANGES if on.get(e)]
 
     def wants(self, m: "Market") -> bool:
@@ -329,6 +339,57 @@ def parse_entropy(data) -> dict[str, Market]:
                     "entropy", coin=coin, taker_fee=fee)
         out[mk.key] = mk
     return out
+
+
+def _decimals(*vals: str) -> int:
+    return max((len(v.split(".")[1]) if "." in v else 0) for v in vals)
+
+
+def parse_var(data: dict) -> tuple[dict[str, Market], dict[str, dict]]:
+    """Рынки Variational и их котировки {key: quotes}."""
+    out, quotes = {}, {}
+    for a in data.get("listings") or []:
+        sym = str(a.get("ticker") or "").upper()
+        q = a.get("quotes") or {}
+        base_q = q.get("base") or {}
+        if not sym or not base_q.get("bid") or not base_q.get("ask"):
+            continue
+        base = ALIASES.get(sym, sym)
+        px = float(a.get("mark_price") or 0)
+        # у RFQ нет шага цены: тики считаем в центах, как у акций (для дешёвых — по знакам котировки)
+        dec = 2 if px >= 1 else _decimals(str(base_q["bid"]), str(base_q["ask"]))
+        mk = Market(zlib.crc32(sym.encode()) & 0x7FFFFFFF, sym, base, "stock", "perp", dec, px, "var")
+        out[mk.key] = mk
+        quotes[mk.key] = q
+    return out, quotes
+
+
+def var_avg_price(q: dict, side: str, size_usd: float) -> float:
+    """Средняя цена по RFQ-котировкам Variational для размера size_usd (линейно между $1k и $100k)."""
+    p0 = float(q["base"][side])
+    p1 = float((q.get("size_1k") or q["base"])[side])
+    p100 = float((q.get("size_100k") or q.get("size_1k") or q["base"])[side])
+    if size_usd <= 1000:
+        return p0 + (p1 - p0) * size_usd / 1000
+    if size_usd <= 100_000:
+        return p1 + (p100 - p1) * (size_usd - 1000) / 99_000
+    return p100 + (p100 - p1) * (size_usd - 100_000) / 99_000      # дальше $100k — продолжаем наклон
+
+
+def var_metrics(q: dict, tick: float, size_usd: float) -> "Metrics | None":
+    try:
+        bid, ask = float(q["base"]["bid"]), float(q["base"]["ask"])
+        if ask <= bid:
+            return None
+        mid = (ask + bid) / 2
+        buy, sell = var_avg_price(q, "ask", size_usd), var_avg_price(q, "bid", size_usd)
+    except (KeyError, TypeError, ValueError):
+        return None
+    quoted = 100_000.0 if q.get("size_100k") else 1000.0
+    return Metrics(bid=bid, ask=ask, mid=mid, spread_pct=(ask - bid) / mid * 100,
+                   spread_ticks=float(round((ask - bid) / tick)),
+                   buy_impact=max(buy - ask, 0) / ask * 100, sell_impact=max(bid - sell, 0) / bid * 100,
+                   depth_bid=quoted, depth_ask=quoted)
 
 
 def select_markets(all_markets: dict[str, Market]) -> dict[str, Market]:
@@ -580,6 +641,7 @@ class App:
         self.known_ids: set[str] = set()
         self.restored = self.load_state()
         self.hist = H.History(HISTORY_FILE)
+        self.var_quotes: dict[str, dict] = {}       # котировки Variational: key → quotes
         for cid in TG_CHAT_IDS:  # владелец подписан всегда
             self.users.setdefault(cid, User(cid))
         self._migrate_legacy_settings()
@@ -707,6 +769,13 @@ class App:
         errors = 0
         for ex, (_, api, _) in EXCHANGES.items():
             try:
+                if ex == "var":
+                    async with self.http.get(api, timeout=aiohttp.ClientTimeout(total=30)) as r:
+                        r.raise_for_status()
+                        vm, vq = parse_var(await r.json(content_type=None))
+                        out.update(vm)
+                        self.var_quotes.update(vq)
+                    continue
                 if ex == "entropy":
                     async with self.http.post(api, json={"type": "metaAndAssetCtxs", "dex": ENTROPY_DEX},
                                               timeout=aiohttp.ClientTimeout(total=30)) as r:
@@ -723,7 +792,7 @@ class App:
                 out.update({k: m for k, m in self.markets.items() if m.ex == ex})
         if errors == len(EXCHANGES):
             raise RuntimeError("ни одна биржа не ответила")
-        # на Core и Entropy оставляем только те акции, что есть на RH — они нужны лишь для сравнения
+        # на Core, Entropy и Variational оставляем только те акции, что есть на RH — они нужны лишь для сравнения
         rh = {(m.base, m.mtype) for m in out.values() if m.ex == "rh"}
         if rh:
             out = {k: m for k, m in out.items() if m.ex == "rh" or (m.base, m.mtype) in rh}
@@ -787,6 +856,10 @@ class App:
             t.cancel()
         self.feeds = []
         for ex in EXCHANGES:
+            if ex == "var":
+                if any(m.ex == "var" for m in self.markets.values()):
+                    self.feeds.append(asyncio.create_task(self.var_feed(), name="feed-var"))
+                continue
             if ex == "entropy":
                 coins = {m.key: m.coin for m in self.markets.values() if m.ex == "entropy"}
                 if coins:
@@ -861,6 +934,32 @@ class App:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 60)
 
+    async def var_feed(self) -> None:
+        """Variational: стакана нет, раз в несколько секунд берём котировки всех рынков одним запросом."""
+        while True:
+            try:
+                async with self.http.get(VAR_STATS_URL, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    r.raise_for_status()
+                    _, quotes = parse_var(await r.json(content_type=None))
+                now = time.time()
+                for key, q in quotes.items():
+                    if key not in self.markets:
+                        continue
+                    self.var_quotes[key] = q
+                    book = self.books.setdefault(key, Book())       # простая «книга» для истории и проверок
+                    try:
+                        book.bids = {float(q["base"]["bid"]): 1.0}
+                        book.asks = {float(q["base"]["ask"]): 1.0}
+                    except (KeyError, TypeError, ValueError):
+                        continue
+                    book.nonce = max(book.nonce, 0) + 1
+                    book.updated = now
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                log.warning("Variational: %s", e)
+            await asyncio.sleep(VAR_POLL_SEC)
+
     def on_hl_book(self, by_coin: dict[str, str], data: dict) -> None:
         key = by_coin.get(data.get("coin"))
         levels = data.get("levels") or []
@@ -908,7 +1007,12 @@ class App:
         if cache is not None and key in cache:
             return cache[key]
         book = self.books.get(m.key)
-        met = compute_metrics(book, m.tick, s.size, s.band) if book and book.ready else None
+        if m.ex == "var":
+            q = self.var_quotes.get(m.key)
+            fresh = book is not None and time.time() - book.updated < 60
+            met = var_metrics(q, m.tick, s.size) if q and fresh else None
+        else:
+            met = compute_metrics(book, m.tick, s.size, s.band) if book and book.ready else None
         if cache is not None:
             cache[key] = met
         return met
@@ -1013,7 +1117,7 @@ class App:
         ticker, ex, spread = None, "both", u.s.spread
         for a in args:
             low = a.lower().rstrip("%").replace(",", ".")
-            if low in ("rh", "core", "entropy"):
+            if low in EX_KEYS:
                 ex = low
             elif re.fullmatch(r"(\d+(\.\d+)?|\.\d+)(bps)?", low):
                 spread = float(low.removesuffix("bps"))
@@ -1023,7 +1127,7 @@ class App:
                 ticker = a
         if not ticker:
             return "Укажи тикер: <code>/watch NVDA</code>"
-        if ex in ("core", "entropy") and ex not in EXCHANGES:
+        if ex in ("core", "entropy", "var") and ex not in EXCHANGES:
             return f"Мониторинг {EXCHANGES.get(ex, (ex.upper(),))[0]} сейчас выключен на уровне бота."
         if not 0 < spread <= 5:
             return "Порог спреда — от 0 до 5%, например <code>/watch NVDA 0.01</code>"
@@ -1058,7 +1162,7 @@ class App:
         ticker, period, only = None, 86400, None
         for a in args:
             low = a.lower()
-            if low in ("rh", "core", "entropy"):
+            if low in EX_KEYS:
                 only = low
             elif re.fullmatch(r"\d+[hdчд]", low):
                 n = int(low[:-1])
@@ -1070,7 +1174,7 @@ class App:
             return "Укажи тикер: <code>/history NVDA</code>"
         base = norm_ticker(ticker)
         # RH + Entropy всегда (если пара там есть), Core — если включён /core
-        exs = [only] if only else ["rh"] + [e for e in u.s.extras() + ["entropy"] if e in EXCHANGES and e != "rh"]
+        exs = [only] if only else ["rh"] + [e for e in u.s.extras() + ["entropy", "var"] if e in EXCHANGES and e != "rh"]
         exs = list(dict.fromkeys(exs))
         now = time.time()
         series, text = [], []
@@ -1256,7 +1360,7 @@ class App:
             for m in self.markets.values():
                 if m.mtype == "perp" and m.ex in exs and (met := self.metrics_for(m, s)):
                     by_base.setdefault(m.base, {})[m.ex] = met
-            need = ["rh"] + (["entropy"] if "entropy" in exs else [])
+            need = ["rh"] + [e for e in ("entropy", "var") if e in exs]
             by_base = {b: v for b, v in by_base.items() if all(e in v for e in need)}
             rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))[:top]
             for base, mets in rows:
@@ -1299,8 +1403,9 @@ class App:
             met = self.metrics_for(m, s)
             if met:
                 by_base.setdefault(m.base, {})[m.ex] = met
-        if "entropy" in exs:                       # с Entropy — только пары, что есть на обеих биржах
-            by_base = {b: v for b, v in by_base.items() if "rh" in v and "entropy" in v}
+        for e in ("entropy", "var"):               # с Entropy / Variational — только пары, что есть на обеих биржах
+            if e in exs:
+                by_base = {b: v for b, v in by_base.items() if "rh" in v and e in v}
         if not by_base:
             return "Стаканы ещё загружаются, попробуй через несколько секунд."
         rows = sorted(by_base.items(), key=lambda kv: min(x.spread_pct for x in kv[1].values()))
@@ -1363,6 +1468,7 @@ class App:
                 "/core — добавить или убрать сравнение с основным Lighter (Core)\n"
                 "/bps — показывать спред в базисных пунктах вместо % (1 bps = 0.01%), ещё раз — обратно\n"
                 "/entropy — добавить или убрать сравнение с Entropy (.io)\n"
+                "/var — добавить или убрать сравнение с Variational\n"
                 "/reset — вернуть настройки по умолчанию\n"
                 "/help — эта справка")
 
@@ -1395,11 +1501,12 @@ class App:
             reply = self.welcome_text(u)
         elif cmd == "/help":
             reply = self.help_text(chat_id)
-        elif cmd in ("/status", "/status_rh", "/status_core", "/status_entropy", "/status_text"):
-            only = {"/status_rh": "rh", "/status_core": "core", "/status_entropy": "entropy"}.get(cmd)
+        elif cmd in ("/status", "/status_rh", "/status_core", "/status_entropy", "/status_var", "/status_text"):
+            only = {"/status_rh": "rh", "/status_core": "core", "/status_entropy": "entropy",
+                    "/status_var": "var"}.get(cmd)
             as_text = cmd == "/status_text"
             for a in args:
-                if a.lower() in ("rh", "core", "entropy"):
+                if a.lower() in EX_KEYS:
                     only = a.lower()
                 if a.lower() in ("text", "текст"):
                     as_text = True
@@ -1432,10 +1539,10 @@ class App:
             else:
                 u.s.venue = "rh" if u.s.venue == "both" else "both"
                 if u.s.venue == "both":
-                    u.s.entropy = False          # сравнение одно: RH ↔ Core или RH ↔ Entropy
+                    u.s.entropy = u.s.var = False   # сравнение одно: RH ↔ Core / Entropy / Variational
                 for st in u.pairs.values():
                     st.ok_since = None
-                reply = ("➕ Core добавлен (Entropy убран). Алерты по-прежнему по Lighter RH, но в каждом видна та же акция "
+                reply = ("➕ Core добавлен (Entropy и Variational убраны). Алерты по-прежнему по Lighter RH, но в каждом видна та же акция "
                          "на основном Lighter, а если пара хороша на обеих биржах — придёт 🟢🟢. "
                          "В /status — обе биржи. /core — убрать."
                          if u.s.venue == "both" else
@@ -1454,16 +1561,34 @@ class App:
             else:
                 u.s.entropy = not u.s.entropy
                 if u.s.entropy:
-                    u.s.venue = "rh"             # сравнение одно: RH ↔ Entropy, без Core
+                    u.s.venue, u.s.var = "rh", False   # сравнение одно: RH ↔ Entropy
                 for st in u.pairs.values():
                     st.ok_since = None
                 common = sorted({m.base for m in self.markets.values() if m.ex == "entropy"})
-                reply = (("➕ Сравнение RH ↔ Entropy включено (Core убран). Алерты по-прежнему по Lighter RH; "
+                reply = (("➕ Сравнение RH ↔ Entropy включено (Core и Variational убраны). Алерты по-прежнему по Lighter RH; "
                           "если акция есть на Entropy (.io), в алерте видна она же там, а если пара хороша "
                           "на обеих биржах — придёт 🟢🟢. В /status — только общие пары RH и Entropy.\n"
                           f"Общие с RH пары: {', '.join(common) or 'пока нет'}.\n"
                           "На Entropy есть комиссия тейкера — она видна в строке сравнения. /entropy — убрать.")
                          if u.s.entropy else "➖ Entropy убран. /entropy — вернуть.")
+        elif cmd == "/var":
+            if "var" not in EXCHANGES:
+                reply = "Мониторинг Variational сейчас выключен на уровне бота."
+            else:
+                u.s.var = not u.s.var
+                if u.s.var:
+                    u.s.venue, u.s.entropy = "rh", False   # сравнение одно: RH ↔ Variational
+                for st in u.pairs.values():
+                    st.ok_since = None
+                common = sorted({m.base for m in self.markets.values() if m.ex == "var"})
+                reply = (("➕ Сравнение RH ↔ Variational включено (Core и Entropy убраны). Алерты по-прежнему по "
+                          "Lighter RH; если акция есть на Variational, в алерте видна она же там, а если пара хороша "
+                          "на обеих биржах — придёт 🟢🟢. В /status — только общие пары, /status_var — только Variational.\n"
+                          f"Общие с RH пары ({len(common)}): {', '.join(common) or 'пока нет'}.\n"
+                          "У Variational нет стакана: это RFQ — цены bid/ask котируются на $1k и $100k, "
+                          "проскальзывание на твой размер считается по ним, глубина — сколько котируется ($100k). "
+                          "Комиссии нет. /var — убрать.")
+                         if u.s.var else "➖ Variational убран. /var — вернуть.")
         elif cmd == "/reset":
             u.s = Settings()
             u.pairs.clear()
@@ -1535,6 +1660,7 @@ class App:
             {"command": "resume", "description": "Включить алерты"},
             {"command": "core", "description": "Сравнение с основным Lighter вкл/выкл"},
             {"command": "entropy", "description": "Сравнение с Entropy (.io) вкл/выкл"},
+            {"command": "var", "description": "Сравнение с Variational вкл/выкл"},
             {"command": "reset", "description": "Сбросить настройки"},
         ])
         while True:
@@ -1581,7 +1707,9 @@ class App:
                 book = self.books.get(m.key)
                 if not book or not book.ready or not book.bids or not book.asks:
                     continue
-                if now - book.updated > 120 and m.ex != "entropy" and book.updated:
+                if now - book.updated > 120 and m.ex not in ("entropy", "var") and book.updated:
+                    continue
+                if m.ex == "var" and now - book.updated > 60:
                     continue
                 bid, ask = max(book.bids), min(book.asks)
                 if ask <= bid:

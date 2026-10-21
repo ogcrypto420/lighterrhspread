@@ -23,6 +23,7 @@ RED = (248, 113, 113)
 TAG_RH = (56, 189, 248)
 TAG_CORE = (167, 139, 250)
 TAG_ENTROPY = (251, 146, 60)
+TAG_VAR = (244, 114, 182)
 
 W = 940
 PAD = 28
@@ -96,7 +97,7 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
     # заголовок
     msk = datetime.now(timezone.utc) + timedelta(hours=3)
     d.text((PAD * s, 26 * s), title, font=f_title, fill=TEXT)
-    d.text((PAD * s, 66 * s), f"{'Lighter · Entropy' if any(c.tag == 'ENTROPY' for g in groups for c in g.cells) else 'Lighter'} · обновлено {msk:%H:%M:%S} МСК", font=f_sub, fill=MUTED)
+    d.text((PAD * s, 66 * s), f"{' · '.join(['Lighter'] + [n for t, n in (('ENTROPY', 'Entropy'), ('VAR', 'Variational')) if any(c.tag == t for g in groups for c in g.cells)])} · обновлено {msk:%H:%M:%S} МСК", font=f_sub, fill=MUTED)
 
     # колонки: (заголовок, правая граница x, выравнивание)
     cols = {
@@ -142,7 +143,7 @@ def render_status(title: str, groups: list[Group], *, spread: float, impact: flo
             if ci == 0:
                 put("ticker", (ry + 8) * s, g.ticker, f_tick, TEXT)
             # бейдж биржи
-            tc = {"RH": TAG_RH, "CORE": TAG_CORE, "ENTROPY": TAG_ENTROPY}.get(c.tag, TAG_CORE)
+            tc = {"RH": TAG_RH, "CORE": TAG_CORE, "ENTROPY": TAG_ENTROPY, "VAR": TAG_VAR}.get(c.tag, TAG_CORE)
             tw = d.textlength(c.tag, font=f_tag)
             bx, by = cols["tag"][0] * s, (ry + 10) * s
             d.rounded_rectangle([bx, by, bx + tw + 16 * s, by + 19 * s], radius=9 * s, outline=tc, width=s * 1)
@@ -187,7 +188,7 @@ class Series:
 
 
 MSK = 3 * 3600
-TAG_COLORS = {"RH": TAG_RH, "CORE": TAG_CORE, "ENTROPY": TAG_ENTROPY}
+TAG_COLORS = {"RH": TAG_RH, "CORE": TAG_CORE, "ENTROPY": TAG_ENTROPY, "VAR": TAG_VAR}
 
 
 def _blend(c, bg, a):

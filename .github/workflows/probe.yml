@@ -9,18 +9,5 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -q aiohttp cryptography "eth-account>=0.13,<0.14"
       - run: git clone -q --depth 1 https://github.com/ogcrypto420/lighter-guardian.git g
-      - name: signer
-        run: |
-          cd g && python fetch_signer.py > ../sig.txt 2>&1; echo "rc=$?" >> ../sig.txt
-          echo "::notice::SIGNER $(tr '\n' ' ' < ../sig.txt | head -c 1500)"
-      - name: tests
-        run: |
-          cd g
-          for t in test_guardian test_hedge test_wallets test_security test_setup; do
-            python -m tests.$t > ../t_$t.txt 2>&1; echo "$t rc=$? :: $(tail -3 ../t_$t.txt | tr '\n' ' ' | head -c 600)" >> ../tests.txt
-          done
-          echo "::notice::TESTS $(tr '\n' ' ' < ../tests.txt | head -c 3500)"
-      - name: live
-        run: python live.py || echo "::notice::LIVE FAILED"
-      - name: e2e
-        run: python e2e.py "$PWD/g" "$(cat found.txt 2>/dev/null || echo 1)" || echo "::notice::E2E FAILED"
+      - name: ws
+        run: python ws.py

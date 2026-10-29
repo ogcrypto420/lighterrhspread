@@ -8,6 +8,14 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -q aiohttp cryptography "eth-account>=0.13,<0.14"
-      - run: git clone -q --depth 1 https://github.com/ogcrypto420/lighter-guardian.git g
-      - name: ws
-        run: python ws.py
+      - name: signer
+        run: cd gcode && python fetch_signer.py
+      - name: tests
+        run: |
+          cd gcode
+          for t in test_guardian test_hedge test_wallets test_security test_setup test_review; do
+            python -m tests.$t > ../t_$t.txt 2>&1; echo "$t rc=$? :: $(tail -1 ../t_$t.txt)" >> ../tests.txt
+          done
+          echo "::notice::TESTS $(tr '\n' ' ' < ../tests.txt | head -c 3500)"
+      - name: live
+        run: python e2e2.py "$PWD/gcode" 3

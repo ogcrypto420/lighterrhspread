@@ -100,8 +100,7 @@ try:
 except Exception as e:
     import traceback
     out.append("CRASH " + traceback.format_exc()[-1500:])
-text = " || ".join(out).replace("\n", " | ").replace("
-", " | ")
+text = " || ".join(out).replace("\n", " | ")
 print(text)
 for i in range(0, min(len(text), 3800 * 8), 3800):
     print("::notice::" + text[i:i + 3800])

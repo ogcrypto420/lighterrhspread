@@ -30,7 +30,8 @@ async def stream_check():
                         "ws_positions": {ex.markets[m].symbol: p for m, p in g.positions.items() if p and m in ex.markets},
                         "quotes": len(g.quotes), "nvda_quote": q and [q.bid, q.ask, q.mark, round(time.time() - q.ts, 1)],
                         "best_bid_rest": bp_bid, "last_msg_age": round(time.time() - ex.last_msg, 1),
-                        "sub_error": ex.sub_error, "active_orders_with_bad_key": ao})
+                        "sub_error": ex.sub_error, "active_orders_with_bad_key": ao,
+                        "rest_calls_last_min": ex.calls_last_min(), "ws_silence_reconnect_sec": Gd.WS_SILENCE_SEC})
 
 try:
     asyncio.run(stream_check())

@@ -95,7 +95,11 @@ async def main():
             note("WS_TYPES", sorted(set(map(str, types))))
 
 
-asyncio.run(main())
+try:
+    asyncio.run(main())
+except Exception as e:
+    import traceback
+    out.append("CRASH " + traceback.format_exc()[-1500:])
 text = " || ".join(out)
 print(text)
 for i in range(0, min(len(text), 3800 * 8), 3800):
